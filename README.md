@@ -1,4 +1,4 @@
-# EnDa Chat
+# Chat Room
 
 Ephemeral, end-to-end encrypted, peer-to-peer chat rooms. Text, files, and voice
 go browser to browser. The server helps two browsers find each other and then
