@@ -37,11 +37,28 @@ the same room name and passkey in both.
 
 Environment variables:
 
-| Variable            | Default     | Meaning                                            |
-| ------------------- | ----------- | -------------------------------------------------- |
-| `HOST`         | `127.0.0.1` | Bind address. Use `0.0.0.0` to serve a LAN.         |
-| `PORT`         | `8000`      | Port.                                              |
-| `DEBUG_STATS`  | unset       | `1` exposes `/api/debug/stats`. Development only.   |
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HOST` | `127.0.0.1`, or `0.0.0.0` when `RENDER_EXTERNAL_URL` is set | Bind address. Loopback locally so a dev server is not exposed by accident; all interfaces behind a platform router, where loopback would make the service unreachable. |
+| `PORT` | `8000` | Port. Most platforms inject this. |
+| `DEBUG_STATS` | unset | `1` exposes `/api/debug/stats`. Development only. |
+| `RENDER_EXTERNAL_URL` | unset | Public base URL. Sets the keep-alive target and flips the `HOST` default. Render exports it automatically; anywhere else, set it by hand. |
+| `DISCORD_WEBHOOK_URL` | unset | If set, keep-alive notices are posted to Discord. **This is the one thing that sends data off the machine** — see [below](#the-keep-alive-loop-is-the-one-thing-that-phones-home). |
+| `KEEPALIVE_INTERVAL_SECONDS` | `600` | Seconds between self-pings. Mainly a testing hook. |
+
+Note that `HOST` and `PORT` are deliberately unprefixed, which makes them
+generic: an unrelated `PORT` already exported in your shell will change the bind
+port. That is usually what you want on a hosting platform and occasionally a
+surprise locally.
+
+### Endpoints
+
+| Route | Purpose |
+| --- | --- |
+| `GET /health` | `{"status": "ok", "timestamp": "…"}`. For platform health checks and the keep-alive loop. Status and clock only. |
+| `GET /api/health` | `{"ok": true}`. Older liveness probe, kept for the test suite. |
+| `GET /api/debug/stats` | Room and peer counts. Only mounted when `DEBUG_STATS=1`. |
+| `WS /ws` | Signaling. See [Protocol reference](#protocol-reference). |
 
 ### Web Crypto needs a secure context
 
@@ -71,6 +88,7 @@ client/index.html         markup, design tokens, component CSS
 client/app.js             crypto, mesh, protocol, audio, UI
 tests/signaling_test.py   black-box checks against a running relay
 tests/browser_e2e_test.py two headless browsers, driven over DevTools Protocol
+tests/keepalive_test.py   the self-ping loop and its Discord notice
 ```
 
 No npm, no bundler, no build step. The client uses WebRTC, Web Crypto, and the
@@ -151,7 +169,7 @@ What the server enforces, and how you can confirm it:
 
 | Claim | Mechanism | Check |
 | --- | --- | --- |
-| No request logging | `logging.disable()`, every uvicorn/starlette/websockets logger detached, `access_log=False`, `log_config=None` | Run the relay with stdout piped to a file. After any amount of traffic it contains only the 3-line startup banner. |
+| No request logging | `logging.disable()`, every uvicorn/starlette/websockets logger detached, `access_log=False`, `log_config=None` | Run the relay with stdout piped to a file. After any amount of traffic it still contains only the startup banner — 3 lines, up to 6 when the keep-alive, Discord, and CORS notices apply. `tests/keepalive_test.py` asserts the loop adds no per-ping output. |
 | No database, no files | There is no storage code. The only session state is one `dict`. | `grep -rE "open\(|sqlite|write|Path\(" server/main.py` |
 | Rooms die when empty | `Rooms.leave` does `del self._rooms[room_id]` on the last departure | `tests/signaling_test.py` asserts it against `/api/debug/stats` |
 | Server never sees room names | It rejects anything that is not 64 lowercase hex, so a plaintext name cannot even be submitted | `tests/signaling_test.py` tries five malformed ids |
@@ -169,6 +187,51 @@ raw bytes were never in JavaScript memory, so there is nothing a zero-fill
 could reach. JavaScript cannot order the browser to scrub its own key store.
 What it can do is never hold the material and stop referring to the handle,
 which is what happens.
+
+---
+
+## The keep-alive loop is the one thing that phones home
+
+Free hosting tiers idle a service out when nothing calls it. A background task
+therefore pings `RENDER_EXTERNAL_URL + /health` every 600 seconds, and if
+`DISCORD_WEBHOOK_URL` is set, posts a short notice to Discord afterwards.
+
+Two things this loop cannot do:
+
+- **It cannot wake a sleeping instance.** Once the platform has stopped the
+  process, nothing is running to make a request. It prevents idling out while
+  alive; it is not a resurrection mechanism. Use an external cron-style pinger
+  if you need that.
+- **It is not necessarily allowed.** Some providers treat self-pinging as
+  working around the free tier they designed. Check the terms for wherever you
+  deploy.
+
+### What the Discord notice contains
+
+Only that the process answered, and when:
+
+```json
+{
+  "username": "Chat Room P2P",
+  "embeds": [{
+    "title": "Keep-alive ping OK",
+    "description": "`GET https://your-host/health` returned **200**.",
+    "color": 4513435,
+    "timestamp": "2026-08-07T13:14:17+00:00",
+    "footer": { "text": "Signaling relay is awake. No session data is reported." }
+  }]
+}
+```
+
+No room ids, no peer ids, no counts, no addresses. `tests/keepalive_test.py`
+asserts each of those absences against a captured payload rather than trusting
+the code to stay that way.
+
+Be clear-eyed about what enabling it costs, though: a Discord channel
+accumulating a ping every ten minutes **is** a retained log of when your relay
+was up. It says nothing about who used it, but it is a record, and it lives on
+someone else's server. Leave `DISCORD_WEBHOOK_URL` unset and nothing leaves the
+machine at all.
 
 ---
 
@@ -219,6 +282,16 @@ size, and per-connection message rate, and never allocates on behalf of an
 unjoined socket. It is not hardened against a distributed flood; put it behind
 something that is.
 
+**CORS is open to every origin.** `allow_origins=["*"]` lets any website's
+JavaScript read this origin's HTTP responses. Today those are `/health` and
+`/api/health`, which carry no session data, so the practical exposure is small —
+but it is a door held open for no functional gain, and it contradicts the CSP.
+Note also that it does nothing for `/ws`: WebSocket handshakes are not subject
+to CORS, so a permissive policy neither helps nor hinders peers. To close it,
+replace `["*"]` in `server/main.py` with your own origin. Relatedly, the
+WebSocket endpoint performs no `Origin` check, so any page can open a signaling
+socket — it cannot read a room without the passkey, but it can occupy a slot.
+
 ---
 
 ## Removing the CDN
@@ -253,7 +326,8 @@ through scale, weight, and tracking instead.
 
 ## Tests
 
-Both suites run against a live relay. Start it first:
+121 assertions across three suites. The first two need a live relay; start it
+first:
 
 ```powershell
 $env:DEBUG_STATS = "1"
@@ -261,13 +335,21 @@ $env:DEBUG_STATS = "1"
 ```
 
 ```powershell
-# 50 assertions: protocol, validation, isolation, peer cap, room deletion,
-# rate limiting, security headers, zero-storage grep
+# 57 assertions: protocol, validation, isolation, peer cap, room deletion,
+# rate limiting, security headers, /health shape, CORS, zero-storage grep
 .venv\Scripts\python.exe tests\signaling_test.py
 
 # 41 assertions in two real headless browsers: key agreement, mesh formation,
 # encrypted chat, file integrity, voice tracks, mute/deafen, teardown
 .venv\Scripts\python.exe tests\browser_e2e_test.py
+```
+
+```powershell
+# 23 assertions, self-contained — starts its own relay and its own mock
+# endpoint, so it needs neither a running server nor a Discord account:
+# the loop fires, targets the right URL, keeps cycling, survives a dead
+# target, adds no log output, and leaks no session data to the webhook
+.venv\Scripts\python.exe tests\keepalive_test.py
 ```
 
 `browser_e2e_test.py` finds Chrome or Edge on its own and drives it over the

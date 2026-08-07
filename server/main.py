@@ -39,10 +39,13 @@ import os
 import re
 import secrets
 import time
-from contextlib import suppress
+import urllib.request
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
@@ -121,6 +124,40 @@ JOIN_DEADLINE_SECONDS = 15.0
 DEBUG_STATS = os.environ.get("DEBUG_STATS") == "1"
 
 CLIENT_DIR = Path(__file__).resolve().parent.parent / "client"
+
+
+# ---------------------------------------------------------------------------
+# Keep-alive
+#
+# Free hosting tiers idle a service out after a period with no inbound
+# requests. This loop gives the platform some. Two honest limits:
+#
+#   * It cannot wake a sleeping instance. Once the platform has stopped the
+#     process, nothing here is running to make a request. This prevents
+#     idling out while alive; it is not a resurrection mechanism.
+#   * Some providers consider self-pinging a way around the free tier they
+#     designed. Check the terms for wherever this runs.
+#
+# The ping carries no session data, and neither does the Discord notice: the
+# only facts either one transmits are "this process answered" and the time.
+# ---------------------------------------------------------------------------
+
+#: Ten minutes by default. Overridable so the test suite can watch the loop
+#: complete several cycles instead of waiting out a real interval.
+KEEPALIVE_INTERVAL_SECONDS = max(1, int(os.environ.get("KEEPALIVE_INTERVAL_SECONDS", "600")))
+#: One early ping so a misconfiguration shows up in seconds, not ten minutes.
+KEEPALIVE_WARMUP_SECONDS = 5.0
+KEEPALIVE_TIMEOUT_SECONDS = 15.0
+
+#: Render exports this. Anything else can set it explicitly.
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+
+#: Optional. Setting this means uptime notices leave this machine for Discord.
+#: See README, "The keep-alive loop is the one thing that phones home".
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+
+#: Mint green, matching the client's "live" accent.
+DISCORD_EMBED_COLOR = 0x4ADE9B
 
 
 # ---------------------------------------------------------------------------
@@ -208,11 +245,121 @@ class RateLimiter:
 # App
 # ---------------------------------------------------------------------------
 
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _keepalive_target() -> str:
+    """Where to send the self-ping. External URL if the platform gave us one."""
+    base = RENDER_EXTERNAL_URL or f"http://127.0.0.1:{os.environ.get('PORT', '8000')}"
+    return f"{base}/health"
+
+
+def _http_get_status(url: str) -> int:
+    """Blocking GET, run off the event loop. Returns the status code."""
+    request = urllib.request.Request(url, method="GET", headers={"User-Agent": "chatroom-p2p-keepalive"})
+    with urllib.request.urlopen(request, timeout=KEEPALIVE_TIMEOUT_SECONDS) as response:
+        response.read(0)
+        return response.status
+
+
+def _http_post_json(url: str, payload: dict) -> int:
+    """Blocking POST, run off the event loop. Returns the status code."""
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "chatroom-p2p-keepalive"},
+    )
+    with urllib.request.urlopen(request, timeout=KEEPALIVE_TIMEOUT_SECONDS) as response:
+        response.read(0)
+        return response.status
+
+
+async def _notify_discord(target: str, status: int) -> None:
+    """Post an uptime notice. Carries no room, peer, or address information."""
+    payload = {
+        "username": "Chat Room P2P",
+        "embeds": [
+            {
+                "title": "Keep-alive ping OK",
+                "description": f"`GET {target}` returned **{status}**.",
+                "color": DISCORD_EMBED_COLOR,
+                "timestamp": _utc_now(),
+                "footer": {"text": "Signaling relay is awake. No session data is reported."},
+            }
+        ],
+    }
+    await asyncio.to_thread(_http_post_json, DISCORD_WEBHOOK_URL, payload)
+
+
+async def keepalive_loop() -> None:
+    """Ping ourselves forever. This coroutine must never exit on its own.
+
+    Every iteration is wrapped, so a DNS failure, a timeout, a 502 from the
+    platform's router, or a Discord outage costs one cycle and nothing more.
+    CancelledError is deliberately re-raised -- swallowing it would make the
+    task un-stoppable and hang shutdown.
+    """
+    await asyncio.sleep(KEEPALIVE_WARMUP_SECONDS)
+    while True:
+        try:
+            target = _keepalive_target()
+            status = await asyncio.to_thread(_http_get_status, target)
+            if DISCORD_WEBHOOK_URL and 200 <= status < 300:
+                await _notify_discord(target, status)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            # Intentionally total. Nothing a ping can raise is worth ending
+            # the loop over, and there is nowhere to report it: this process
+            # does not log.
+            pass
+
+        try:
+            await asyncio.sleep(KEEPALIVE_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    task = asyncio.create_task(keepalive_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
 app = FastAPI(
     title="Chat Room P2P signaling relay",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
+    lifespan=lifespan,
+)
+
+# Requested: accept any origin. Two things worth knowing about this choice.
+#
+#   1. It does nothing for /ws. WebSocket handshakes are not subject to CORS,
+#      so a permissive policy here neither helps nor hinders peers connecting.
+#   2. It lets any website's JavaScript read this origin's HTTP responses.
+#      Today that means /health and /api/health, which carry no session data,
+#      so the practical exposure is small -- but it is a door held open for no
+#      functional gain, and it contradicts the CSP two blocks down.
+#
+# To close it, replace ["*"] with your own origin, e.g.
+# ["https://chat.example.com"]. allow_credentials stays False because "*" plus
+# credentials is rejected by browsers anyway.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 # Tailwind is loaded from its CDN, so script-src has to name that host and
@@ -254,6 +401,16 @@ async def security_headers(request, call_next):
     for header, value in SECURITY_HEADERS.items():
         response.headers[header] = value
     return response
+
+
+@app.get("/health")
+async def health_status() -> JSONResponse:
+    """Liveness for the platform's health check and the keep-alive loop.
+
+    Status and clock only. No room count, no peer count, nothing derived from
+    a session -- an uptime probe is not a reason to start emitting metadata.
+    """
+    return JSONResponse({"status": "ok", "timestamp": _utc_now()})
 
 
 @app.get("/api/health")
@@ -428,7 +585,7 @@ async def signaling(ws: WebSocket) -> None:
             await _broadcast(remaining, {"type": "peer-leave", "peerId": peer_id})
 
 
-# Mounted last so /ws and /api/* win over any same-named static path.
+# Mounted last so /ws, /health, and /api/* win over any same-named static path.
 if CLIENT_DIR.is_dir():
     app.mount("/", StaticFiles(directory=str(CLIENT_DIR), html=True), name="client")
 
@@ -440,19 +597,31 @@ if CLIENT_DIR.is_dir():
 def main() -> None:
     import uvicorn
 
-    host = os.environ.get("HOST", "127.0.0.1")
+    # Locally, bind loopback so a dev server is not exposed to the LAN by
+    # accident. On a platform that routes traffic to the container, loopback
+    # would make the service unreachable, so default to all interfaces there.
+    # RENDER_EXTERNAL_URL being set is the signal that we are behind a router.
+    default_host = "0.0.0.0" if RENDER_EXTERNAL_URL else "127.0.0.1"
+    host = os.environ.get("HOST", default_host)
     port = int(os.environ.get("PORT", "8000"))
 
-    # This banner is the only thing this process ever writes, and it carries no
-    # session data. flush=True so it still appears when stdout is a pipe --
-    # otherwise it sits in the buffer and the operator sees nothing at all.
+    # This banner is the only thing this process writes on its own, and it
+    # carries no session data. flush=True so it still appears when stdout is a
+    # pipe -- otherwise it sits in the buffer and the operator sees nothing.
     print(f"Chat Room P2P signaling relay -> http://{host}:{port}", flush=True)
     print(
         f"  rooms: in-memory only  |  peer cap: {MAX_PEERS_PER_ROOM}  |  logging: disabled",
         flush=True,
     )
+    print(
+        f"  keep-alive: every {KEEPALIVE_INTERVAL_SECONDS}s -> {_keepalive_target()}",
+        flush=True,
+    )
     if DEBUG_STATS:
         print("  WARNING: DEBUG_STATS=1 -- /api/debug/stats is exposed (dev only)", flush=True)
+    if DISCORD_WEBHOOK_URL:
+        print("  NOTE: DISCORD_WEBHOOK_URL is set -- uptime notices leave this machine", flush=True)
+    print("  NOTE: CORS is open to all origins", flush=True)
 
     uvicorn.run(
         app,

@@ -23,6 +23,7 @@ import re
 import sys
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 import websockets
 
@@ -106,6 +107,46 @@ async def test_health_leaks_nothing() -> None:
         payload = json.loads(response.read())
     check("health returns ok", payload.get("ok") is True)
     check("health exposes no room count", "rooms" not in payload and "peers" not in payload, str(payload))
+
+
+async def test_health_endpoint() -> None:
+    print("\n[ /health for the platform probe and keep-alive loop ]")
+    with urllib.request.urlopen(f"{BASE_HTTP}/health", timeout=5) as response:
+        payload = json.loads(response.read())
+        headers = {k.lower(): v for k, v in response.headers.items()}
+
+    check("status is ok", payload.get("status") == "ok", str(payload))
+    check("timestamp is present", isinstance(payload.get("timestamp"), str), str(payload))
+
+    stamp = payload.get("timestamp", "")
+    try:
+        parsed = datetime.fromisoformat(stamp)
+        valid = parsed.tzinfo is not None
+    except ValueError:
+        valid = False
+    check("timestamp is tz-aware ISO 8601", valid, stamp)
+
+    # An uptime probe is not a reason to start emitting session metadata.
+    leaked = [k for k in payload if k not in {"status", "timestamp"}]
+    check("/health exposes nothing but status and time", not leaked, str(leaked))
+
+    # CORS headers only appear when the request carries an Origin, so a plain
+    # urlopen sees none. Ask as a cross-origin caller would.
+    cross_origin = urllib.request.Request(
+        f"{BASE_HTTP}/health", headers={"Origin": "https://unrelated.example"}
+    )
+    with urllib.request.urlopen(cross_origin, timeout=5) as response:
+        cors = {k.lower(): v for k, v in response.headers.items()}
+
+    check("CORS is open to any origin",
+          cors.get("access-control-allow-origin") == "*",
+          cors.get("access-control-allow-origin", "(absent)"))
+    check("CORS does not also allow credentials",
+          cors.get("access-control-allow-credentials") != "true",
+          cors.get("access-control-allow-credentials", ""))
+    check("no CORS headers without an Origin (middleware is conditional)",
+          "access-control-allow-origin" not in headers,
+          headers.get("access-control-allow-origin", ""))
 
 
 async def test_room_id_validation() -> None:
@@ -325,6 +366,7 @@ async def main() -> int:
     for test in (
         test_static_and_headers,
         test_health_leaks_nothing,
+        test_health_endpoint,
         test_room_id_validation,
         test_join_and_relay,
         test_cross_room_isolation,
