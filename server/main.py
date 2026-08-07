@@ -1,5 +1,5 @@
 """
-EnDa Chat -- ephemeral E2EE peer-to-peer chat room.
+Chat Room P2P -- ephemeral E2EE peer-to-peer chat room.
 
 This module is the *entire* server: a minimal WebSocket signaling relay whose
 only job is to help browsers find each other and exchange SDP/ICE. It is
@@ -118,7 +118,7 @@ JOIN_DEADLINE_SECONDS = 15.0
 #: Dev-only. Exposes live room/peer counts at /api/debug/stats so the test
 #: suite can assert that empty rooms are really deleted. Off by default: the
 #: count alone is metadata an observer should not get for free.
-DEBUG_STATS = os.environ.get("ENDA_DEBUG_STATS") == "1"
+DEBUG_STATS = os.environ.get("DEBUG_STATS") == "1"
 
 CLIENT_DIR = Path(__file__).resolve().parent.parent / "client"
 
@@ -209,7 +209,7 @@ class RateLimiter:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="EnDa Chat signaling relay",
+    title="Chat Room P2P signaling relay",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -440,19 +440,19 @@ if CLIENT_DIR.is_dir():
 def main() -> None:
     import uvicorn
 
-    host = os.environ.get("ENDA_HOST", "127.0.0.1")
-    port = int(os.environ.get("ENDA_PORT", "8000"))
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "8000"))
 
     # This banner is the only thing this process ever writes, and it carries no
     # session data. flush=True so it still appears when stdout is a pipe --
     # otherwise it sits in the buffer and the operator sees nothing at all.
-    print(f"EnDa Chat signaling relay -> http://{host}:{port}", flush=True)
+    print(f"Chat Room P2P signaling relay -> http://{host}:{port}", flush=True)
     print(
         f"  rooms: in-memory only  |  peer cap: {MAX_PEERS_PER_ROOM}  |  logging: disabled",
         flush=True,
     )
     if DEBUG_STATS:
-        print("  WARNING: ENDA_DEBUG_STATS=1 -- /api/debug/stats is exposed (dev only)", flush=True)
+        print("  WARNING: DEBUG_STATS=1 -- /api/debug/stats is exposed (dev only)", flush=True)
 
     uvicorn.run(
         app,

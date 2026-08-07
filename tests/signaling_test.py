@@ -6,7 +6,7 @@ evidence for those claims rather than a smoke test.
 
 Run:
     # terminal 1
-    set ENDA_DEBUG_STATS=1
+    set DEBUG_STATS=1
     .venv\\Scripts\\python.exe -m server.main
 
     # terminal 2
@@ -26,8 +26,8 @@ import urllib.request
 
 import websockets
 
-BASE_HTTP = os.environ.get("ENDA_TEST_HTTP", "http://127.0.0.1:8000")
-BASE_WS = os.environ.get("ENDA_TEST_WS", "ws://127.0.0.1:8000/ws")
+BASE_HTTP = os.environ.get("TEST_HTTP", "http://127.0.0.1:8000")
+BASE_WS = os.environ.get("TEST_WS", "ws://127.0.0.1:8000/ws")
 
 passed: list[str] = []
 failed: list[str] = []
@@ -73,7 +73,7 @@ async def test_static_and_headers() -> None:
         body = response.read().decode("utf-8", "replace")
         headers = {k.lower(): v for k, v in response.headers.items()}
 
-    check("index.html is served", "EnDa Chat" in body)
+    check("index.html is served", "Chat Room P2P" in body)
     check("app.js is referenced", 'src="app.js"' in body)
     check("Cache-Control is no-store", "no-store" in headers.get("cache-control", ""))
     check("Referrer-Policy is no-referrer", headers.get("referrer-policy") == "no-referrer")
@@ -205,7 +205,7 @@ async def test_room_is_deleted_when_empty() -> None:
     stats_before = debug_stats()
     if stats_before is None:
         check("debug stats reachable", False,
-              "start the server with ENDA_DEBUG_STATS=1 to assert room deletion directly")
+              "start the server with DEBUG_STATS=1 to assert room deletion directly")
         return
 
     rid = room_id("ephemeral-test")

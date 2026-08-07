@@ -1,5 +1,5 @@
 /*
- * EnDa Chat — client.
+ * Chat Room P2P — client.
  *
  * Everything that matters happens here. The server helps two browsers find
  * each other and then has no further part in the conversation.
@@ -40,7 +40,7 @@
    ========================================================================== */
 
 const PBKDF2_ITERATIONS = 600_000;
-const KDF_DOMAIN = 'endachat/v1';
+const KDF_DOMAIN = 'chatroom-p2p/v1';
 const WIRE_VERSION = 1;
 
 const MAX_PEERS = 8;
@@ -397,7 +397,7 @@ class Peer {
     };
 
     if (this.initiator) {
-      this.bindChannel(this.pc.createDataChannel('enda', { ordered: true }));
+      this.bindChannel(this.pc.createDataChannel('chat', { ordered: true }));
     } else {
       this.pc.ondatachannel = (event) => this.bindChannel(event.channel);
     }

@@ -1,4 +1,4 @@
-# Chat Room
+# Chat Room P2P
 
 Ephemeral, end-to-end encrypted, peer-to-peer chat rooms. Text, files, and voice
 go browser to browser. The server helps two browsers find each other and then
@@ -39,9 +39,9 @@ Environment variables:
 
 | Variable            | Default     | Meaning                                            |
 | ------------------- | ----------- | -------------------------------------------------- |
-| `ENDA_HOST`         | `127.0.0.1` | Bind address. Use `0.0.0.0` to serve a LAN.         |
-| `ENDA_PORT`         | `8000`      | Port.                                              |
-| `ENDA_DEBUG_STATS`  | unset       | `1` exposes `/api/debug/stats`. Development only.   |
+| `HOST`         | `127.0.0.1` | Bind address. Use `0.0.0.0` to serve a LAN.         |
+| `PORT`         | `8000`      | Port.                                              |
+| `DEBUG_STATS`  | unset       | `1` exposes `/api/debug/stats`. Development only.   |
 
 ### Web Crypto needs a secure context
 
@@ -66,12 +66,11 @@ chat.example.com {
 ## Layout
 
 ```
-server/main.py            the entire server (~330 lines)
+server/main.py            the entire server (~470 lines)
 client/index.html         markup, design tokens, component CSS
 client/app.js             crypto, mesh, protocol, audio, UI
 tests/signaling_test.py   black-box checks against a running relay
 tests/browser_e2e_test.py two headless browsers, driven over DevTools Protocol
-legacy/                   the 2022-2023 prototype this replaced, kept intact
 ```
 
 No npm, no bundler, no build step. The client uses WebRTC, Web Crypto, and the
@@ -83,11 +82,11 @@ DOM directly; the only runtime dependency it pulls is Tailwind, from a CDN
 ## The key schedule
 
 ```
-passkey ──PBKDF2-SHA256, 600 000 iters, salt = SHA256("endachat/v1|room|" + roomName)──► master (256 bit)
+passkey ──PBKDF2-SHA256, 600 000 iters, salt = SHA256("chatroom-p2p/v1|room|" + roomName)──► master (256 bit)
 
-master ──HKDF-SHA256, info "endachat/v1/aes-gcm"──► AES-GCM-256 key   (non-extractable)
-       ──HKDF-SHA256, info "endachat/v1/room-id"──► 32 bytes → hex    (sent to the relay)
-       ──HKDF-SHA256, info "endachat/v1/seal"───► 16 bytes            (the visible seal)
+master ──HKDF-SHA256, info "chatroom-p2p/v1/aes-gcm"──► AES-GCM-256 key   (non-extractable)
+       ──HKDF-SHA256, info "chatroom-p2p/v1/room-id"──► 32 bytes → hex    (sent to the relay)
+       ──HKDF-SHA256, info "chatroom-p2p/v1/seal"───► 16 bytes            (the visible seal)
 ```
 
 One expensive PBKDF2 pass, then three cheap domain-separated HKDF expansions.
@@ -257,7 +256,7 @@ through scale, weight, and tracking instead.
 Both suites run against a live relay. Start it first:
 
 ```powershell
-$env:ENDA_DEBUG_STATS = "1"
+$env:DEBUG_STATS = "1"
 .venv\Scripts\python.exe -m server.main
 ```
 
@@ -266,7 +265,7 @@ $env:ENDA_DEBUG_STATS = "1"
 # rate limiting, security headers, zero-storage grep
 .venv\Scripts\python.exe tests\signaling_test.py
 
-# 40 assertions in two real headless browsers: key agreement, mesh formation,
+# 41 assertions in two real headless browsers: key agreement, mesh formation,
 # encrypted chat, file integrity, voice tracks, mute/deafen, teardown
 .venv\Scripts\python.exe tests\browser_e2e_test.py
 ```

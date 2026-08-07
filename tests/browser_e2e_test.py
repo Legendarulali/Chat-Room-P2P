@@ -32,8 +32,8 @@ import urllib.request
 
 import websockets
 
-BASE_HTTP = os.environ.get("ENDA_TEST_HTTP", "http://127.0.0.1:8000")
-DEBUG_PORT = int(os.environ.get("ENDA_TEST_CDP_PORT", "9333"))
+BASE_HTTP = os.environ.get("TEST_HTTP", "http://127.0.0.1:8000")
+DEBUG_PORT = int(os.environ.get("TEST_CDP_PORT", "9333"))
 
 ROOM = "kitchen-table"
 PASSKEY = "correct-horse-battery-staple"
@@ -136,7 +136,7 @@ class Browser:
     def __init__(self, binary: str) -> None:
         self.binary = binary
         self.process: subprocess.Popen | None = None
-        self.profile = tempfile.mkdtemp(prefix="enda-e2e-")
+        self.profile = tempfile.mkdtemp(prefix="chatroom-e2e-")
         self.browser_ws = None
         self.pages: list[Page] = []
 
@@ -410,7 +410,7 @@ async def run(browser: Browser) -> None:
     # Verify by actually pressing Save, which is the path a user takes. Reading
     # the blob with fetch() would be blocked by this app's own CSP, and asking
     # the CSP to allow it just to make a test convenient is the wrong trade.
-    download_dir = tempfile.mkdtemp(prefix="enda-dl-")
+    download_dir = tempfile.mkdtemp(prefix="chatroom-dl-")
     await browser._browser_call("Browser.setDownloadBehavior", {
         "behavior": "allow", "downloadPath": download_dir,
     })

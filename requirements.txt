@@ -1,4 +1,4 @@
-# EnDa Chat — signaling relay.
+# Chat Room P2P — signaling relay.
 #
 # That is the whole dependency list. The client uses no npm packages and no
 # JavaScript libraries: WebRTC, Web Crypto, and the DOM are all browser-native.
