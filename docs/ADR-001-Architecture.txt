@@ -1,0 +1,38 @@
+ADR 001: Decizii de Arhitectură pentru Chat-Room-P2PStatus: Accepted & Documented
+Proiect: Chat-Room-P2P (GitHub)
+Domeniu: Ephemeral End-to-End Encrypted (E2EE) Peer-to-Peer Communication
+
+Decizia 1: Server de Semnalizare în Python (FastAPI + WebSockets) în locul Node.jsContext: Serverul de semnalizare are un singur rol: să ajute doi utilizatori să își facă cunoștință (să schimbe adresele de IP și parametrii WebRTC). Odată ce conexiunea s-a stabilit, serverul nu mai intervine.
+
+Opțiunea Aleasă (X): FastAPI + uvicorn WebSockets în Python.
+
+Alternativa Respinsă (Y): Node.js (Fastify / Socket.io).
+
+Justificare & Compromis: Serverul are sub 200 de linii de cod și rulează 100% în memorie RAM (fără fișiere pe disc, fără baze de date). S-a ales Python pentru a nu adăuga dependențe externe (Node/npm) pe mașina de dezvoltare, păstrând backend-ul extrem de simplu și ușor de auditat.
+
+
+Decizia 2: WebRTC Nativ din Browser în locul Librăriilor Externe (simple-peer / PeerJS)Context: Schimbul de mesaje, fișiere și semnale audio trebuie să se facă direct de la un browser la altul.
+
+Opțiunea Aleasă (X): API-ul nativ RTCPeerConnection și RTCDataChannel furnizat direct de browsere (Chrome, Firefox, Edge).
+
+Alternativa Respinsă (Y): Utilizarea unor librării wrapper precum simple-peer sau PeerJS.
+
+Justificare & Compromis: Librăriile terțe introduc riscuri de securitate (sunt proiecte vechi, neactualizate). Folosind codul nativ din browser, aplicația este mai rapidă, nu depinde de module externe și respectă standardele actuale de securitate ale WebRTC.
+
+
+Decizia 3: Criptare Zero-Knowledge prin Web Crypto API (HKDF-SHA256 + AES-GCM-256)Context: Serverul nu trebuie să poată citi niciodată mesajele, numele camerelor sau parolele utilizatorilor.
+
+Opțiunea Aleasă (X): Parola camerei este transformată local în browser (prin PBKDF2/HKDF) într-o cheie de criptare AES-GCM-256. Serverul primește doar un cod anonim (HMAC) pentru a ști în ce cameră să te pună, fără să știe parola reală.
+
+Alternativa Respinsă (Y): Criptare pe server sau stocarea cheilor în localStorage / Cookies.
+
+Justificare & Compromis: Cheia de criptare rămâne salvată doar în memoria RAM volatilă ca un obiect non-extractabil (CryptoKey). Dacă cineva închide tab-ul, cheia dispare definitiv. Chiar dacă un hacker ar intercepta serverul, ar vedea doar pachete de date complet indescifrabile.
+
+
+Decizia 4: Arhitectură Full-Mesh (Limita de 8 Participanți și Vizibilitatea IP-urilor)Context: În P2P pur, fiecare utilizator trimite datele audio și mesajele direct către toți ceilalți participanți din cameră.
+
+Opțiunea Aleasă (X): Topologie Full-Mesh cu o limită fixă de maxim 8 participanți per cameră.
+
+Alternativa Respinsă (Y): Introducerea unui server media central (SFU) pentru grupuri mari.
+
+Justificare & Compromis: Introducerea unui server media (SFU) ar fi însemnat că datele audio trec printr-un calculator central, ceea ce distrugea conceptul de P2P privat. Compromisul asumat: fiecare participant trimite $N-1$ conexiuni, ceea ce consumă lățime de bandă și expune adresa de IP către ceilalți membri din cameră (fapt specificat transparent în interfața aplicației).
