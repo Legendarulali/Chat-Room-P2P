@@ -11,7 +11,18 @@ What this server knows about a session
     PBKDF2 -> HKDF from the room name and passkey. Neither the room name nor
     the passkey is recoverable from it.
   * A random per-connection peer id that this server itself invents.
+  * Each room's capacity, and which of those invented peer ids currently hosts
+    it. Both are coordination state: a number and a pointer, carrying nothing
+    about who anyone is.
   * Opaque signaling blobs it copies from one socket to another.
+
+Host and capacity are not security boundaries
+---------------------------------------------
+This server assigns the host and enforces the cap, so it could equally name
+the wrong peer host or admit a ninth guest. Those controls exist to let a group
+organise itself, not to defend against the relay. What the relay still cannot
+do -- however it lies about hosts -- is read a message, because it never holds
+the room key.
 
 What this server never sees
 ---------------------------
@@ -92,8 +103,28 @@ _silence_logging()
 # Limits
 # ---------------------------------------------------------------------------
 
-#: Full-mesh audio degrades sharply past this: each peer uploads N-1 streams.
+#: Default room capacity. Full-mesh audio degrades sharply past this: each peer
+#: uploads N-1 streams, so cost grows with the square of the room.
 MAX_PEERS_PER_ROOM = 8
+
+#: A room needs two people to be a room.
+MIN_CAPACITY = 2
+
+#: Absolute ceiling on what a host may set. Capacity arrives from a client, so
+#: without a bound it is attacker-controlled unbounded state -- one join
+#: claiming a capacity of ten million would let one room exhaust the process.
+#: Raising this past MAX_PEERS_PER_ROOM is allowed and documented as degrading
+#: voice; raising it past this constant is not.
+CAPACITY_CEILING = max(MAX_PEERS_PER_ROOM, int(os.environ.get("CAPACITY_CEILING", "16")))
+
+
+def clamp_capacity(value: object, floor: int = MIN_CAPACITY) -> int:
+    """Coerce anything a client sent into a capacity this server will honour."""
+    try:
+        requested = int(value)
+    except (TypeError, ValueError):
+        return MAX_PEERS_PER_ROOM
+    return max(floor, min(CAPACITY_CEILING, requested))
 
 #: A room id is SHA-derived client-side. Anything else is rejected outright,
 #: which is what stops this relay being usable with plaintext room names.
@@ -164,56 +195,121 @@ DISCORD_EMBED_COLOR = 0x4ADE9B
 # In-memory room registry
 # ---------------------------------------------------------------------------
 
-class Rooms:
-    """room_id -> {peer_id: WebSocket}, and nothing else, ever.
+class Room:
+    """One live room: its occupants, its capacity, and which peer hosts it.
 
-    Guarded by a lock so that the join-capacity check and the insert cannot
+    This is the complete set of what the relay knows about a room. It is
+    coordination state, not content: `peers` maps a peer id this server
+    invented to the socket it arrived on, `capacity` is a number, and `host_id`
+    is one of those invented ids. There is still no room name, no passkey, no
+    nickname, and no message anywhere in here.
+
+    Host order follows insertion order, which dicts preserve, so "the next peer
+    in line" is simply the oldest remaining one.
+    """
+
+    __slots__ = ("peers", "capacity", "host_id")
+
+    def __init__(self, capacity: int) -> None:
+        self.peers: dict[str, WebSocket] = {}
+        self.capacity = capacity
+        self.host_id: str | None = None
+
+
+class Rooms:
+    """room_id -> Room.
+
+    Guarded by a lock so that the capacity check and the insert cannot
     interleave: without it, eight simultaneous joins could all observe seven
-    occupants and push the room to fifteen.
+    occupants and push the room past its limit.
     """
 
     def __init__(self) -> None:
-        self._rooms: dict[str, dict[str, WebSocket]] = {}
+        self._rooms: dict[str, Room] = {}
         self._lock = asyncio.Lock()
 
-    async def join(self, room_id: str, ws: WebSocket) -> tuple[str, list[str]] | None:
-        """Insert `ws` into a room. Returns (peer_id, existing_peer_ids) or None if full."""
-        async with self._lock:
-            room = self._rooms.setdefault(room_id, {})
-            if len(room) >= MAX_PEERS_PER_ROOM:
-                if not room:
-                    del self._rooms[room_id]
-                return None
-            peer_id = secrets.token_hex(8)
-            existing = list(room.keys())
-            room[peer_id] = ws
-            return peer_id, existing
+    async def join(
+        self, room_id: str, ws: WebSocket, requested_capacity: object
+    ) -> tuple[str, list[str], str, int] | None:
+        """Insert `ws`. Returns (peer_id, existing_ids, host_id, capacity), or None if full.
 
-    async def leave(self, room_id: str, peer_id: str) -> list[WebSocket]:
-        """Remove a peer and return the sockets that remain. Drops the room when empty."""
+        The requested capacity is honoured only when this call creates the room.
+        A later joiner cannot talk the room into a different size -- otherwise
+        anyone with the passkey could overrule the host just by reconnecting.
+        """
         async with self._lock:
             room = self._rooms.get(room_id)
             if room is None:
-                return []
-            room.pop(peer_id, None)
-            if not room:
+                room = Room(clamp_capacity(requested_capacity))
+                self._rooms[room_id] = room
+
+            if len(room.peers) >= room.capacity:
+                if not room.peers:
+                    # Refused into an empty room we just made; do not leave it behind.
+                    del self._rooms[room_id]
+                return None
+
+            peer_id = secrets.token_hex(8)
+            existing = list(room.peers.keys())
+            room.peers[peer_id] = ws
+            if room.host_id is None:
+                # First peer through the door hosts the room.
+                room.host_id = peer_id
+            return peer_id, existing, room.host_id, room.capacity
+
+    async def leave(self, room_id: str, peer_id: str) -> tuple[list[WebSocket], str | None, int]:
+        """Remove a peer.
+
+        Returns (remaining sockets, new host id if it changed, capacity).
+        Drops the room entirely when the last peer goes.
+        """
+        async with self._lock:
+            room = self._rooms.get(room_id)
+            if room is None:
+                return [], None, MAX_PEERS_PER_ROOM
+            room.peers.pop(peer_id, None)
+
+            if not room.peers:
                 # Last peer out: the room and every trace of it go away now.
                 del self._rooms[room_id]
-                return []
-            return list(room.values())
+                return [], None, room.capacity
+
+            new_host = None
+            if room.host_id == peer_id:
+                # Hand the crown to the oldest remaining peer.
+                room.host_id = next(iter(room.peers))
+                new_host = room.host_id
+            return list(room.peers.values()), new_host, room.capacity
+
+    async def set_capacity(self, room_id: str, peer_id: str, value: object) -> tuple[int, list[WebSocket]] | None:
+        """Host-only capacity change. Returns (applied capacity, sockets) or None if refused.
+
+        Lowering below the current headcount is clamped rather than enforced by
+        eviction: throwing people out of a conversation because the number moved
+        would be a hostile way to resize a room. New joins are what the lower
+        number governs.
+        """
+        async with self._lock:
+            room = self._rooms.get(room_id)
+            if room is None or room.host_id != peer_id:
+                return None
+            room.capacity = clamp_capacity(value, floor=max(MIN_CAPACITY, len(room.peers)))
+            return room.capacity, list(room.peers.values())
 
     async def peers(self, room_id: str) -> dict[str, WebSocket]:
         async with self._lock:
-            return dict(self._rooms.get(room_id, {}))
+            room = self._rooms.get(room_id)
+            return dict(room.peers) if room else {}
 
     async def target(self, room_id: str, peer_id: str) -> WebSocket | None:
         """Look up one peer, scoped to its room -- the relay never crosses rooms."""
         async with self._lock:
-            return self._rooms.get(room_id, {}).get(peer_id)
+            room = self._rooms.get(room_id)
+            return room.peers.get(peer_id) if room else None
 
     async def snapshot(self) -> dict[str, int]:
         async with self._lock:
-            return {rid: len(members) for rid, members in self._rooms.items()}
+            return {rid: len(room.peers) for rid, room in self._rooms.items()}
 
 
 rooms = Rooms()
@@ -500,27 +596,24 @@ async def signaling(ws: WebSocket) -> None:
                     await _close(ws, code=1008)
                     return
 
-                result = await rooms.join(requested, ws)
+                result = await rooms.join(requested, ws, message.get("capacity"))
                 if result is None:
-                    await _send(
-                        ws,
-                        {
-                            "type": "error",
-                            "code": "room_full",
-                            "limit": MAX_PEERS_PER_ROOM,
-                        },
-                    )
+                    await _send(ws, {"type": "error", "code": "room_full"})
                     await _close(ws, code=1013)
                     return
 
-                room_id, peer_id = requested, result[0]
+                peer_id, existing, host_id, capacity = result
+                room_id = requested
                 await _send(
                     ws,
                     {
                         "type": "welcome",
                         "peerId": peer_id,
-                        "peers": result[1],
-                        "limit": MAX_PEERS_PER_ROOM,
+                        "peers": existing,
+                        "hostId": host_id,
+                        "capacity": capacity,
+                        "ceiling": CAPACITY_CEILING,
+                        "minCapacity": MIN_CAPACITY,
                     },
                 )
                 others = [
@@ -561,6 +654,21 @@ async def signaling(ws: WebSocket) -> None:
                 await _send(target, {"type": "signal", "from": peer_id, "data": payload})
                 continue
 
+            # -- set-capacity -----------------------------------------------
+            if kind == "set-capacity":
+                applied = await rooms.set_capacity(room_id, peer_id, message.get("capacity"))
+                if applied is None:
+                    # Not the host. Refusing here is the whole point: otherwise
+                    # any occupant could resize the room.
+                    await _send(ws, {"type": "error", "code": "not_host"})
+                    continue
+                capacity, sockets = applied
+                await _broadcast(
+                    sockets,
+                    {"type": "room-meta", "hostId": peer_id, "capacity": capacity},
+                )
+                continue
+
             # -- leave ------------------------------------------------------
             if kind == "leave":
                 await _close(ws, code=1000)
@@ -581,8 +689,16 @@ async def signaling(ws: WebSocket) -> None:
         pass
     finally:
         if room_id is not None and peer_id is not None:
-            remaining = await rooms.leave(room_id, peer_id)
+            remaining, new_host, capacity = await rooms.leave(room_id, peer_id)
             await _broadcast(remaining, {"type": "peer-leave", "peerId": peer_id})
+            if new_host is not None:
+                # The host left. Tell everyone who holds the crown now, before
+                # any of them try to use a control they no longer have (or do
+                # have, and do not know it yet).
+                await _broadcast(
+                    remaining,
+                    {"type": "room-meta", "hostId": new_host, "capacity": capacity},
+                )
 
 
 # Mounted last so /ws, /health, and /api/* win over any same-named static path.

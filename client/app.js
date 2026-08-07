@@ -43,7 +43,15 @@ const PBKDF2_ITERATIONS = 600_000;
 const KDF_DOMAIN = 'chatroom-p2p/v1';
 const WIRE_VERSION = 1;
 
-const MAX_PEERS = 8;
+/* Defaults only. The relay is authoritative for all three and sends its own
+   values in `welcome`; these just populate the join form before we've asked. */
+const DEFAULT_CAPACITY = 8;
+const MIN_CAPACITY = 2;
+const DEFAULT_CEILING = 16;
+
+/* Past this, full-mesh voice starts to fall apart. The host may still raise the
+   limit -- it is their room -- but they get told what it costs. */
+const MESH_SAFE_CAPACITY = 8;
 
 /** Interop-safe SCTP payload. Encryption adds 13 header + 16 tag bytes. */
 const FILE_CHUNK_BYTES = 16 * 1024;
@@ -246,6 +254,13 @@ const state = {
   seal: null,
   nick: '',
   peerId: '',
+  // Room coordination state, all of it server-assigned. Deliberately not taken
+  // from DataChannel frames: a peer could claim anything there, whereas these
+  // arrive over the signaling socket from the party that actually enforces them.
+  hostId: '',
+  capacity: DEFAULT_CAPACITY,
+  ceiling: DEFAULT_CEILING,
+  minCapacity: MIN_CAPACITY,
   socket: null,
   peers: new Map(),      // peerId -> Peer
   incoming: new Map(),   // transferId -> { from, meta, parts, received }
@@ -282,13 +297,15 @@ function sendToRelay(message) {
 }
 
 /** Resolves once the relay has admitted us, rejects with a reason code. */
-function connectRelay(roomId) {
+function connectRelay(roomId, requestedCapacity) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const sock = new WebSocket(relayUrl());
     state.socket = sock;
 
-    sock.onopen = () => sendToRelay({ type: 'join', room: roomId });
+    // Capacity is a request, not an instruction: the relay honours it only when
+    // this join creates the room, and clamps it to its own bounds either way.
+    sock.onopen = () => sendToRelay({ type: 'join', room: roomId, capacity: requestedCapacity });
 
     sock.onmessage = (event) => {
       let message;
@@ -341,9 +358,44 @@ function handleRelayMessage(message) {
       break;
     }
 
+    case 'room-meta': {
+      const gainedCrown = message.hostId === state.peerId && state.hostId !== state.peerId;
+      const hostChanged = message.hostId !== state.hostId;
+      const previousCapacity = state.capacity;
+
+      state.hostId = message.hostId || state.hostId;
+      if (typeof message.capacity === 'number') {
+        state.capacity = message.capacity;
+        // A burst of clicks produces a confirmation per click. Hold the intent
+        // until the relay catches up to it, otherwise the number visibly walks
+        // backwards through every intermediate value. Give up on the intent
+        // only once it is confirmed or the relay has clamped it out of reach.
+        const floor = Math.max(state.minCapacity, state.peers.size + 1);
+        const clampedOut = state.capacity >= state.ceiling || state.capacity <= floor;
+        if (capacityIntent === state.capacity || clampedOut) capacityIntent = null;
+      }
+
+      if (gainedCrown) {
+        systemMessage('You are the host now — the previous host left. You can change the room size.');
+      } else if (hostChanged) {
+        const host = state.peers.get(state.hostId);
+        systemMessage(`${host?.nick || 'Someone else'} is the host now.`);
+      }
+      if (state.capacity !== previousCapacity && !hostChanged) {
+        systemMessage(`Room size is now ${state.capacity}.`);
+      }
+      renderPeers();
+      renderCapacityControl();
+      break;
+    }
+
     case 'error':
       if (message.code === 'room_full') {
-        systemMessage(`This room is full at ${message.limit || MAX_PEERS} people.`, 'warn');
+        systemMessage('This room is full.', 'warn');
+      } else if (message.code === 'not_host') {
+        // The crown moved between the click and the relay reading it.
+        systemMessage("You're not the host, so the room size didn't change.", 'warn');
+        renderCapacityControl();
       }
       break;
 
@@ -958,7 +1010,7 @@ function renderPeers() {
   const peers = [...state.peers.values()];
   const total = peers.length + 1;
 
-  $('peer-count').textContent = `${total}/${MAX_PEERS}`;
+  $('peer-count').textContent = `${total}/${state.capacity}`;
   $('room-sub').textContent = total === 1
     ? 'Just you so far'
     : `${total} people · end-to-end encrypted`;
@@ -969,6 +1021,9 @@ function renderPeers() {
       peers.length ? 'In room' : 'Waiting for others');
   }
 
+  // The stepper's note quotes the headcount, so it has to move with the roster.
+  renderCapacityControl();
+
   list.innerHTML = '';
 
   list.appendChild(peerRow({
@@ -978,6 +1033,7 @@ function renderPeers() {
     muted: audio.muted,
     deafened: audio.deafened,
     connected: true,
+    isHost: state.hostId === state.peerId,
   }));
 
   for (const peer of peers) {
@@ -988,11 +1044,12 @@ function renderPeers() {
       muted: peer.muted,
       deafened: peer.deafened,
       connected: peer.verified,
+      isHost: state.hostId === peer.id,
     }));
   }
 }
 
-function peerRow({ id, nick, suffix, muted, deafened, connected }) {
+function peerRow({ id, nick, suffix, muted, deafened, connected, isHost }) {
   const li = document.createElement('li');
   li.className = 'peer-row flex items-center gap-2.5 rounded-lg px-1.5 py-1.5';
 
@@ -1007,12 +1064,30 @@ function peerRow({ id, nick, suffix, muted, deafened, connected }) {
   const label = document.createElement('div');
   label.className = 'min-w-0 flex-1';
   const name = document.createElement('p');
-  name.className = 'text-[13px] truncate leading-tight';
-  name.style.color = connected ? 'var(--text)' : 'var(--faint)';
-  name.textContent = nick;
+  name.className = 'text-[13px] truncate leading-tight flex items-center gap-1.5';
+  // Amber marks the host. It is the same token the disclosure panel uses, so
+  // keep this restrained -- a glyph and the name's colour, no filled badge.
+  name.style.color = isHost ? 'var(--amber)' : (connected ? 'var(--text)' : 'var(--faint)');
+
+  if (isHost) {
+    const crown = document.createElement('span');
+    crown.className = 'flex-none text-[11px] leading-none';
+    crown.textContent = '👑';
+    crown.title = 'Room host — sets the room size';
+    crown.setAttribute('role', 'img');
+    crown.setAttribute('aria-label', 'host');
+    name.appendChild(crown);
+  }
+
+  const nameText = document.createElement('span');
+  nameText.className = 'truncate';
+  nameText.textContent = nick;
+  name.appendChild(nameText);
+
   if (suffix) {
     const tag = document.createElement('span');
-    tag.className = 'text-faint text-[11px] ml-1.5';
+    // No left margin: the row is flex now, so the gap already spaces this.
+    tag.className = 'text-faint text-[11px] flex-none';
     tag.textContent = suffix;
     name.appendChild(tag);
   }
@@ -1037,6 +1112,59 @@ function stateIcon(kind) {
     ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><path d="M3 3l18 18"/></svg>'
     : '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 14v-3a8 8 0 0 1 16 0v3"/><path d="M3 3l18 18"/></svg>';
   return span;
+}
+
+/**
+ * Show the stepper to the host and nobody else, and keep it honest about what
+ * each button will actually do.
+ */
+/** Pending stepper target, or null when the display matches the relay. */
+let capacityIntent = null;
+
+function renderCapacityControl() {
+  const panel = $('capacity-control');
+  const isHost = Boolean(state.peerId) && state.hostId === state.peerId;
+
+  panel.classList.toggle('hidden', !isHost);
+  if (!isHost) return;
+
+  const occupied = state.peers.size + 1;
+  const floor = Math.max(state.minCapacity, occupied);
+  const shown = capacityIntent === null ? state.capacity : capacityIntent;
+
+  $('capacity-value').textContent = `${occupied} / ${shown}`;
+  // Lowering stops at the headcount: nobody gets evicted by a number change.
+  $('capacity-down').disabled = shown <= floor;
+  $('capacity-up').disabled = shown >= state.ceiling;
+
+  let note;
+  if (shown > MESH_SAFE_CAPACITY) {
+    note = `Above ${MESH_SAFE_CAPACITY}, every peer uploads more audio than the mesh handles well. Text and files are fine.`;
+  } else if (shown <= occupied) {
+    note = 'At capacity. Raise the limit to let anyone else in.';
+  } else {
+    note = `Room for ${shown - occupied} more. Ceiling is ${state.ceiling}.`;
+  }
+  $('capacity-note').textContent = note;
+}
+
+/**
+ * Step the limit by `delta`.
+ *
+ * Clicks accumulate against a local intent rather than against the confirmed
+ * capacity. Reading state.capacity per click would silently drop every press
+ * that landed before the relay's answer came back, so a quick double-tap on +
+ * would move the number by one.
+ */
+function stepCapacity(delta) {
+  const floor = Math.max(state.minCapacity, state.peers.size + 1);
+  const from = capacityIntent === null ? state.capacity : capacityIntent;
+  const target = Math.max(floor, Math.min(state.ceiling, from + delta));
+  if (target === from) return;
+
+  capacityIntent = target;
+  renderCapacityControl(); // show the intent immediately; the relay confirms it
+  sendToRelay({ type: 'set-capacity', capacity: target });
 }
 
 /** A range only when there is one. On loopback every value is 0, and "0–0 ms"
@@ -1184,14 +1312,23 @@ function appendFileCard(author, transfer, mine) {
 
   card.appendChild(head);
 
+  // Geometry here is set inline rather than with utility classes. Tailwind's
+  // Play CDN generates CSS by observing the DOM, and an <i> that never receives
+  // its `block` class stays inline -- where a width is simply ignored, so the
+  // bar renders at zero no matter what percentage it is told to be.
   const bar = document.createElement('div');
-  bar.className = 'mt-2.5 h-1 rounded-full overflow-hidden';
+  bar.className = 'mt-2.5 rounded-full overflow-hidden';
+  bar.style.height = '4px';
   bar.style.background = 'var(--raise)';
   const fill = document.createElement('i');
-  fill.className = 'block h-full';
+  fill.dataset.role = 'file-progress';
+  fill.style.display = 'block';
+  fill.style.height = '100%';
   fill.style.background = 'var(--signal)';
   fill.style.width = mine ? '0%' : '100%';
-  fill.style.transition = 'width 120ms linear';
+  // No width transition. It bought nothing on a bar that steps once per 16 KiB
+  // chunk, and an in-flight transition meant the rendered width lagged the value
+  // it had been given -- a finished transfer could sit showing an unfilled bar.
   bar.appendChild(fill);
   card.appendChild(bar);
 
@@ -1269,13 +1406,13 @@ function joinError(text) {
 }
 
 const RELAY_ERRORS = {
-  room_full: `This room is full at ${MAX_PEERS} people. Full-mesh audio gets unstable past that.`,
+  room_full: 'That room is full. Its host sets the limit, so ask them to raise it.',
   relay_unreachable: "Can't reach the signaling relay. Check that the server is running.",
   bad_room_id: 'The relay rejected the room identifier. Reload and try again.',
   rate_limited: 'The relay rate-limited this connection. Wait a moment and rejoin.',
 };
 
-async function join(roomName, passkey, nick, wantMic) {
+async function join(roomName, passkey, nick, wantMic, requestedCapacity) {
   $('join-btn').disabled = true;
   $('join-error').classList.add('hidden');
   $('join-work').classList.remove('hidden');
@@ -1314,7 +1451,7 @@ async function join(roomName, passkey, nick, wantMic) {
 
   let welcome;
   try {
-    welcome = await connectRelay(session.roomId);
+    welcome = await connectRelay(session.roomId, requestedCapacity);
   } catch (err) {
     state.roomKey = null;
     state.seal = null;
@@ -1328,15 +1465,25 @@ async function join(roomName, passkey, nick, wantMic) {
   $('app').classList.remove('hidden');
   $('room-label').textContent = roomName;
 
+  // The relay is authoritative for all of this; adopt its answer, not our ask.
+  state.hostId = welcome.hostId || '';
+  if (typeof welcome.capacity === 'number') state.capacity = welcome.capacity;
+  if (typeof welcome.ceiling === 'number') state.ceiling = welcome.ceiling;
+  if (typeof welcome.minCapacity === 'number') state.minCapacity = welcome.minCapacity;
+
   renderSeal();
   renderSelf();
   renderPeers();
+  renderCapacityControl();
   renderTransport();
   setStatus(welcome.peers.length ? 'live' : 'connecting',
     welcome.peers.length ? 'In room' : 'Waiting for others');
 
   if (wantMic && !micReady) {
     systemMessage('Joined without a microphone — the browser denied access. You can still read, type, and hear others.', 'warn');
+  }
+  if (state.hostId === state.peerId) {
+    systemMessage(`You opened this room, so you're the host. Room size is ${state.capacity}.`);
   }
   systemMessage(
     welcome.peers.length
@@ -1394,6 +1541,8 @@ function destroySession() {
   state.roomKey = null;
   state.seal = null;
   state.roomId = '';
+  state.hostId = '';
+  capacityIntent = null;
 }
 
 /** The one orchestrated moment: the room's mark comes apart. */
@@ -1406,7 +1555,8 @@ function showDestroyed() {
 
   $('log').innerHTML = '';
   $('peer-list').innerHTML = '';
-  $('peer-count').textContent = '0/' + MAX_PEERS;
+  $('peer-count').textContent = `0/${state.capacity}`;
+  $('capacity-control').classList.add('hidden');
   $('room-sub').textContent = 'Session ended';
   setStatus('destroyed', 'Destroyed');
   renderTransport();
@@ -1441,10 +1591,17 @@ function wireEvents() {
     const passkey = $('f-passkey').value;
     const nick = $('f-nick').value.trim();
     if (!roomName || !passkey || !nick) return;
-    join(roomName, passkey, nick, $('f-mic').checked).catch(() => {
+    const capacity = Number.parseInt($('f-capacity').value, 10);
+    join(
+      roomName, passkey, nick, $('f-mic').checked,
+      Number.isFinite(capacity) ? capacity : DEFAULT_CAPACITY,
+    ).catch(() => {
       joinError('Something failed while joining. Reload and try again.');
     });
   });
+
+  $('capacity-down').addEventListener('click', () => stepCapacity(-1));
+  $('capacity-up').addEventListener('click', () => stepCapacity(1));
 
   $('leave-btn').addEventListener('click', () => {
     destroySession();

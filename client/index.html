@@ -298,6 +298,18 @@
                       focus:border-[color:var(--line-hi)] placeholder:text-faint" />
       </label>
 
+      <label class="block mb-4">
+        <span class="eyebrow block mb-2">Max capacity</span>
+        <input id="f-capacity" type="number" value="8" min="2" max="16" step="1"
+               inputmode="numeric" autocomplete="off"
+               class="w-full rounded-lg bg-ink border hairline px-3 py-2.5 text-[15px] outline-none
+                      focus:border-[color:var(--line-hi)] data" />
+        <span class="block text-[12px] text-faint mt-2 leading-snug">
+          Only applies if you open the room. Whoever arrives first sets this and becomes
+          the host; joining an existing room keeps that room's limit.
+        </span>
+      </label>
+
       <label class="flex items-start gap-2.5 mb-5 cursor-pointer select-none">
         <input id="f-mic" type="checkbox" checked
                class="mt-0.5 h-4 w-4 rounded accent-[color:var(--signal)] flex-none" />
@@ -336,8 +348,9 @@
         <li><span class="text-body font-medium">Everyone here learns your IP address.</span>
             Direct connections are what keep the server out of your conversation; the cost
             is that peers see each other's addresses. Encryption does not change this.</li>
-        <li><span class="text-body font-medium">Eight people, maximum.</span>
-            Every peer sends its audio to every other peer, so voice gets unstable past that.</li>
+        <li><span class="text-body font-medium">Whoever opens the room sets its size and hosts it.</span>
+            Eight is the default because every peer sends audio to every other peer, and voice
+            gets unstable past that. The host can change it, up to 16.</li>
         <li><span class="text-body font-medium">Nothing is saved anywhere.</span>
             No account, no history, no server-side copy. Close the tab and the room is gone,
             including for everyone still reading it.</li>
@@ -423,6 +436,30 @@
         <section>
           <p class="eyebrow mb-2"><span>In this room</span> · <span id="peer-count" class="text-muted"></span></p>
           <ul id="peer-list" class="space-y-0.5 -mx-1"></ul>
+
+          <!-- Host-only. Hidden for everyone else, and re-hidden the moment the
+               crown moves on: a control you cannot use should not be visible. -->
+          <div id="capacity-control" class="hidden mt-3 rounded-lg border border-amber/25 bg-amber/[0.05] p-2.5">
+            <p class="eyebrow mb-2 !text-amber">Host · room size</p>
+            <div class="flex items-center gap-2">
+              <button id="capacity-down" type="button" aria-label="Lower the room limit"
+                      class="h-7 w-7 flex-none grid place-items-center rounded-md border hairline
+                             text-muted hover:bg-raise hover:text-body transition
+                             disabled:opacity-30 disabled:cursor-not-allowed">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2.5" stroke-linecap="round"><path d="M5 12h14"/></svg>
+              </button>
+              <output id="capacity-value" class="data flex-1 text-center text-[14px] text-amber"></output>
+              <button id="capacity-up" type="button" aria-label="Raise the room limit"
+                      class="h-7 w-7 flex-none grid place-items-center rounded-md border hairline
+                             text-muted hover:bg-raise hover:text-body transition
+                             disabled:opacity-30 disabled:cursor-not-allowed">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+              </button>
+            </div>
+            <p id="capacity-note" class="text-[11px] text-faint mt-2 leading-snug"></p>
+          </div>
         </section>
 
         <!-- Transport. Real getStats() output: whether you are actually direct. -->

@@ -57,6 +57,15 @@ async def join(ws, rid: str) -> dict:
     return await recv_json(ws)
 
 
+async def join_with(ws, rid: str, capacity) -> dict:
+    """Join asking for a specific capacity. `None` omits the field entirely."""
+    payload = {"type": "join", "room": rid}
+    if capacity is not None:
+        payload["capacity"] = capacity
+    await ws.send(json.dumps(payload))
+    return await recv_json(ws)
+
+
 def debug_stats() -> dict | None:
     try:
         with urllib.request.urlopen(f"{BASE_HTTP}/api/debug/stats", timeout=3) as response:
@@ -173,7 +182,7 @@ async def test_join_and_relay() -> None:
         check("first peer gets welcome", welcome_a.get("type") == "welcome", str(welcome_a))
         check("first peer sees an empty room", welcome_a.get("peers") == [], str(welcome_a.get("peers")))
         check("relay assigns the peer id", isinstance(welcome_a.get("peerId"), str) and len(welcome_a["peerId"]) == 16)
-        check("welcome advertises the peer cap", welcome_a.get("limit") == 8)
+        check("welcome advertises the room capacity", welcome_a.get("capacity") == 8)
 
         welcome_b = await join(bob, rid)
         check("second peer sees the first", welcome_b.get("peers") == [welcome_a["peerId"]], str(welcome_b))
@@ -218,6 +227,145 @@ async def test_cross_room_isolation() -> None:
         assert welcome_two["peerId"]
 
 
+async def test_host_assignment() -> None:
+    print("\n[ the first peer hosts the room ]")
+    rid = room_id("host-test")
+    async with websockets.connect(BASE_WS) as first, websockets.connect(BASE_WS) as second:
+        welcome_first = await join(first, rid)
+        check("first peer is named host", welcome_first.get("hostId") == welcome_first.get("peerId"),
+              str(welcome_first))
+        check("welcome carries capacity", isinstance(welcome_first.get("capacity"), int), str(welcome_first))
+        check("welcome carries the ceiling", isinstance(welcome_first.get("ceiling"), int), str(welcome_first))
+
+        welcome_second = await join(second, rid)
+        check("second peer sees the same host",
+              welcome_second.get("hostId") == welcome_first.get("peerId"), str(welcome_second))
+        check("second peer is not host",
+              welcome_second.get("hostId") != welcome_second.get("peerId"), str(welcome_second))
+
+
+async def test_custom_capacity() -> None:
+    print("\n[ capacity is set by whoever opens the room ]")
+    rid = room_id("capacity-test")
+    async with websockets.connect(BASE_WS) as opener:
+        welcome = await join_with(opener, rid, 3)
+        check("requested capacity of 3 is honoured", welcome.get("capacity") == 3, str(welcome))
+
+        # A later joiner asking for something else must not resize the room.
+        async with websockets.connect(BASE_WS) as latecomer:
+            second = await join_with(latecomer, rid, 16)
+            check("a later joiner cannot change capacity", second.get("capacity") == 3, str(second))
+
+    print("\n[ capacity is clamped to the relay's own bounds ]")
+    for label, requested, expected in (
+        ("below the minimum", 1, 2),
+        ("zero", 0, 2),
+        ("above the ceiling", 9999, 16),
+        ("not a number", "lots", 8),
+        ("missing", None, 8),
+    ):
+        async with websockets.connect(BASE_WS) as ws:
+            welcome = await join_with(ws, room_id(f"clamp-{label}"), requested)
+            check(f"clamps {label} -> {expected}", welcome.get("capacity") == expected, str(welcome))
+
+
+async def test_capacity_enforced() -> None:
+    print("\n[ a custom capacity is actually enforced ]")
+    rid = room_id("enforce-test")
+    sockets = []
+    try:
+        first = await websockets.connect(BASE_WS)
+        sockets.append(first)
+        welcome = await join_with(first, rid, 2)
+        check("room opened with capacity 2", welcome.get("capacity") == 2, str(welcome))
+
+        second = await websockets.connect(BASE_WS)
+        sockets.append(second)
+        check("second peer admitted", (await join(second, rid)).get("type") == "welcome")
+
+        async with websockets.connect(BASE_WS) as third:
+            refusal = await join(third, rid)
+            check("third peer refused at capacity 2", refusal.get("code") == "room_full", str(refusal))
+    finally:
+        for ws in sockets:
+            await ws.close()
+
+
+async def test_host_can_resize() -> None:
+    print("\n[ only the host resizes the room, and everyone is told ]")
+    rid = room_id("resize-test")
+    async with websockets.connect(BASE_WS) as host, websockets.connect(BASE_WS) as guest:
+        await join_with(host, rid, 4)
+        await join(guest, rid)
+        await recv_json(host)  # peer-join
+
+        await host.send(json.dumps({"type": "set-capacity", "capacity": 6}))
+        to_host = await recv_json(host)
+        to_guest = await recv_json(guest)
+        check("host receives room-meta", to_host.get("type") == "room-meta", str(to_host))
+        check("new capacity applied", to_host.get("capacity") == 6, str(to_host))
+        check("guest is told too", to_guest.get("type") == "room-meta" and to_guest.get("capacity") == 6,
+              str(to_guest))
+
+        # A non-host attempt must be refused and must not move the number.
+        await guest.send(json.dumps({"type": "set-capacity", "capacity": 16}))
+        refusal = await recv_json(guest)
+        check("non-host resize refused", refusal.get("code") == "not_host", str(refusal))
+
+        await host.send(json.dumps({"type": "set-capacity", "capacity": 5}))
+        check("capacity unchanged by the refused attempt",
+              (await recv_json(host)).get("capacity") == 5)
+        await recv_json(guest)
+
+        # Lowering below the headcount clamps instead of evicting anyone.
+        await host.send(json.dumps({"type": "set-capacity", "capacity": 1}))
+        clamped = await recv_json(host)
+        check("lowering below occupancy clamps to the headcount",
+              clamped.get("capacity") == 2, str(clamped))
+        await recv_json(guest)
+
+        await host.send(json.dumps({"type": "set-capacity", "capacity": 99}))
+        ceiling = await recv_json(host)
+        check("raising past the ceiling clamps", ceiling.get("capacity") == 16, str(ceiling))
+        await recv_json(guest)
+
+
+async def test_host_reassignment() -> None:
+    print("\n[ the crown moves to the next peer when the host leaves ]")
+    rid = room_id("crown-test")
+    host = await websockets.connect(BASE_WS)
+    async with websockets.connect(BASE_WS) as second, websockets.connect(BASE_WS) as third:
+        welcome_host = await join_with(host, rid, 5)
+        welcome_second = await join(second, rid)
+        await recv_json(host)  # peer-join second
+
+        welcome_third = await join(third, rid)
+        await recv_json(host)   # peer-join third
+        await recv_json(second)  # peer-join third
+
+        check("all three agree on the original host",
+              welcome_second.get("hostId") == welcome_host.get("peerId")
+              and welcome_third.get("hostId") == welcome_host.get("peerId"))
+
+        await host.close()
+
+        # Each remaining peer gets peer-leave, then room-meta with the new host.
+        for name, ws in (("second", second), ("third", third)):
+            left = await recv_json(ws)
+            check(f"{name} sees peer-leave", left.get("type") == "peer-leave", str(left))
+            meta = await recv_json(ws)
+            check(f"{name} is told the new host", meta.get("type") == "room-meta", str(meta))
+            check(f"{name} sees the crown go to the oldest remaining peer",
+                  meta.get("hostId") == welcome_second.get("peerId"), str(meta))
+            check(f"{name} keeps the room's capacity", meta.get("capacity") == 5, str(meta))
+
+        # And the new host can actually use the control.
+        await second.send(json.dumps({"type": "set-capacity", "capacity": 7}))
+        promoted = await recv_json(second)
+        check("promoted peer can resize", promoted.get("capacity") == 7, str(promoted))
+        await recv_json(third)
+
+
 async def test_peer_cap() -> None:
     print("\n[ eight peers in, ninth refused ]")
     rid = room_id("cap-test")
@@ -235,7 +383,6 @@ async def test_peer_cap() -> None:
         async with websockets.connect(BASE_WS) as ninth:
             refusal = await join(ninth, rid)
             check("ninth peer refused", refusal.get("code") == "room_full", str(refusal))
-            check("refusal names the limit", refusal.get("limit") == 8)
     finally:
         for ws in sockets:
             await ws.close()
@@ -370,6 +517,11 @@ async def main() -> int:
         test_room_id_validation,
         test_join_and_relay,
         test_cross_room_isolation,
+        test_host_assignment,
+        test_custom_capacity,
+        test_capacity_enforced,
+        test_host_can_resize,
+        test_host_reassignment,
         test_peer_cap,
         test_room_is_deleted_when_empty,
         test_peer_leave_notice,

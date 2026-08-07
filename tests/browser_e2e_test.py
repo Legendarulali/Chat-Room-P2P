@@ -235,14 +235,20 @@ const set = (id, value) => {{ document.getElementById(id).value = value; }};
 set('f-room', {room!r});
 set('f-passkey', {passkey!r});
 set('f-nick', {nick!r});
+set('f-capacity', {capacity});
 document.getElementById('f-mic').checked = {mic};
 document.getElementById('join-form').requestSubmit();
 return true;
 """
 
 
-async def join(page: Page, nick: str, passkey: str = PASSKEY, mic: bool = True) -> None:
-    await page.eval(JOIN_JS.format(room=ROOM, passkey=passkey, nick=nick, mic="true" if mic else "false"))
+async def join(
+    page: Page, nick: str, passkey: str = PASSKEY, mic: bool = True, capacity: int = 8
+) -> None:
+    await page.eval(JOIN_JS.format(
+        room=ROOM, passkey=passkey, nick=nick, capacity=capacity,
+        mic="true" if mic else "false",
+    ))
 
 
 async def in_room(page: Page) -> bool:
@@ -386,6 +392,103 @@ async def run(browser: Browser) -> None:
     check("deafen mutes the remote sink", bool(deafened))
     await bob.eval("document.getElementById('deaf-btn').click(); return true;")
 
+    print("\n[ host ownership in the UI ]")
+    # alice opened the room, so she wears the crown and gets the stepper.
+    crown_on_alice = await alice.eval("""
+        const rows = [...document.querySelectorAll('#peer-list li')];
+        const mine = rows.find(li => li.textContent.includes('you'));
+        return mine ? mine.textContent.includes('\\u{1F451}') : false;
+    """)
+    check("alice's own row shows the crown", bool(crown_on_alice))
+
+    crown_seen_by_bob = await bob.wait_for("""
+        const rows = [...document.querySelectorAll('#peer-list li')];
+        const other = rows.find(li => li.textContent.includes('alice'));
+        return other && other.textContent.includes('\\u{1F451}') ? 'yes' : false;
+    """, seconds=20)
+    check("bob sees the crown on alice", crown_seen_by_bob == "yes")
+
+    bob_crown_count = await bob.eval("""
+        return [...document.querySelectorAll('#peer-list li')]
+            .filter(li => li.textContent.includes('\\u{1F451}')).length;
+    """)
+    check("exactly one crown in the room", bob_crown_count == 1, str(bob_crown_count))
+
+    host_colour = await bob.eval("""
+        const row = [...document.querySelectorAll('#peer-list li')]
+            .find(li => li.textContent.includes('alice'));
+        const name = row ? row.querySelector('p') : null;
+        return name ? getComputedStyle(name).color : null;
+    """)
+    # --amber is #f2b544 -> rgb(242, 181, 68)
+    check("host name is rendered amber", host_colour == "rgb(242, 181, 68)", str(host_colour))
+
+    print("\n[ host-only capacity controls ]")
+    alice_panel = await alice.eval(
+        "return !document.getElementById('capacity-control').classList.contains('hidden');")
+    check("host sees the capacity stepper", bool(alice_panel))
+    bob_panel = await bob.eval(
+        "return !document.getElementById('capacity-control').classList.contains('hidden');")
+    check("non-host does not see the stepper", not bob_panel)
+
+    shown = await alice.eval("return document.getElementById('capacity-value').textContent;")
+    check("stepper shows headcount over capacity", shown.strip() == "2 / 8", repr(shown))
+
+    await alice.eval("document.getElementById('capacity-up').click(); return true;")
+    raised = await alice.wait_for(
+        "document.getElementById('capacity-value').textContent.trim() === '2 / 9'", seconds=15)
+    check("host raised the limit to 9", bool(raised),
+          await alice.eval("return document.getElementById('capacity-value').textContent;"))
+
+    bob_saw = await bob.wait_for(
+        "document.getElementById('peer-count').textContent === '2/9'", seconds=15)
+    check("bob's roster reflects the new limit", bool(bob_saw),
+          await bob.eval("return document.getElementById('peer-count').textContent;"))
+
+    warned = await alice.eval("return document.getElementById('capacity-note').textContent;")
+    check("host is warned that voice degrades past 8", "mesh" in warned.lower(), warned)
+
+    await alice.eval("document.getElementById('capacity-down').click(); return true;")
+    lowered = await alice.wait_for(
+        "document.getElementById('capacity-value').textContent.trim() === '2 / 8'", seconds=15)
+    check("host lowered it back to 8", bool(lowered))
+
+    # Two people are in the room, so the floor is 2: the button must bottom out
+    # rather than let a number change evict anyone.
+    for _ in range(10):
+        await alice.eval("document.getElementById('capacity-down').click(); return true;")
+        await asyncio.sleep(0.15)
+    floored = await alice.eval("return document.getElementById('capacity-value').textContent;")
+    check("lowering stops at the headcount", floored.strip() == "2 / 2", repr(floored))
+    disabled = await alice.eval("return document.getElementById('capacity-down').disabled;")
+    check("the minus button disables at the floor", bool(disabled))
+
+    print("\n[ a third peer is refused once the room is full ]")
+    gatecrasher = await browser.open_page("gatecrasher", f"{BASE_HTTP}/")
+    await gatecrasher.wait_for("document.getElementById('brand-seal')?.children.length === 16", seconds=20)
+    await join(gatecrasher, "carol")
+    refused = await gatecrasher.wait_for("""
+        const box = document.getElementById('join-error');
+        return !box.classList.contains('hidden') && /full/i.test(box.textContent) ? 'yes' : false;
+    """, seconds=25)
+    check("third peer told the room is full", refused == "yes",
+          await gatecrasher.eval("return document.getElementById('join-error').textContent;"))
+    check("gatecrasher never entered the room",
+          await gatecrasher.eval(
+              "return document.getElementById('app').classList.contains('hidden');"))
+
+    # Clicks accumulate against a local intent now, so a burst reaches its
+    # target -- which is exactly the regression this next line guards.
+    await alice.eval("""
+        const up = document.getElementById('capacity-up');
+        for (let i = 0; i < 6; i += 1) up.click();
+        return true;
+    """)
+    restored = await alice.wait_for(
+        "document.getElementById('capacity-value').textContent.trim() === '2 / 8'", seconds=20)
+    check("a burst of 6 clicks moves the limit by 6", bool(restored),
+          await alice.eval("return document.getElementById('capacity-value').textContent;"))
+
     print("\n[ file transfer over the DataChannel ]")
     # 140 KiB forces multiple 16 KiB chunks, so this exercises the chunking and
     # backpressure path rather than a single-frame shortcut.
@@ -450,6 +553,19 @@ async def run(browser: Browser) -> None:
     """, seconds=15)
     check("alice's card reports the file sent", sent_state == "yes")
 
+    # The bar must actually reach the end. A card that says "sent" over a
+    # part-filled bar is the kind of detail that reads as a stuck transfer.
+    bar = await alice.wait_for("""
+        const fill = [...document.querySelectorAll('#log [data-role="file-progress"]')].pop();
+        if (!fill) return false;
+        const track = fill.parentElement.getBoundingClientRect().width;
+        const done = fill.getBoundingClientRect().width;
+        return track > 0 ? JSON.stringify({ pct: Math.round((done / track) * 100),
+                                            css: fill.style.width }) : false;
+    """, seconds=20)
+    measured = json.loads(bar) if bar else {}
+    check("sender's progress bar is full", measured.get("pct") == 100, str(measured))
+
     print("\n[ a peer with the wrong passkey is refused ]")
     mallory = await browser.open_page("mallory", f"{BASE_HTTP}/")
     await mallory.wait_for("document.getElementById('brand-seal').children.length === 16", seconds=20)
@@ -499,8 +615,58 @@ async def run(browser: Browser) -> None:
     """, seconds=20)
     check("alice sees bob leave", bool(gone))
 
+    print("\n[ the crown moves when the host leaves ]")
+    # alice is the host; when she goes, mallory is alone in her own room, so use
+    # a fresh pair to watch the handover in a shared room.
+    host = await browser.open_page("host", f"{BASE_HTTP}/")
+    heir = await browser.open_page("heir", f"{BASE_HTTP}/")
+    for page in (host, heir):
+        await page.wait_for("document.getElementById('brand-seal')?.children.length === 16", seconds=20)
+
+    await alice.eval("document.getElementById('leave-btn').click(); return true;")
+    await asyncio.sleep(1.0)  # let the room empty so the pair opens it fresh
+
+    await join(host, "dana")
+    await in_room(host)
+    await join(heir, "erik")
+    await in_room(heir)
+    await heir.wait_for("[...document.querySelectorAll('#peer-list li')].length >= 2", seconds=40)
+
+    check("dana holds the crown first",
+          bool(await host.eval(
+              "return !document.getElementById('capacity-control').classList.contains('hidden');")))
+    check("erik has no controls yet",
+          not await heir.eval(
+              "return !document.getElementById('capacity-control').classList.contains('hidden');"))
+
+    await host.eval("document.getElementById('leave-btn').click(); return true;")
+
+    promoted = await heir.wait_for("""
+        const rows = [...document.querySelectorAll('#peer-list li')];
+        const mine = rows.find(li => li.textContent.includes('you'));
+        return mine && mine.textContent.includes('\\u{1F451}') ? 'yes' : false;
+    """, seconds=25)
+    check("erik inherits the crown", promoted == "yes")
+
+    inherited_panel = await heir.wait_for(
+        "!document.getElementById('capacity-control').classList.contains('hidden')", seconds=15)
+    check("erik gains the capacity stepper", bool(inherited_panel))
+
+    told = await heir.eval("""
+        return [...document.querySelectorAll('#log .msg-body')]
+            .some(n => /host now/i.test(n.textContent));
+    """)
+    check("erik is told he is the host now", bool(told))
+
+    # And the inherited control actually works.
+    await heir.eval("document.getElementById('capacity-up').click(); return true;")
+    works = await heir.wait_for(
+        "document.getElementById('capacity-value').textContent.trim() === '1 / 9'", seconds=15)
+    check("the inherited stepper works", bool(works),
+          await heir.eval("return document.getElementById('capacity-value').textContent;"))
+
     print("\n[ no page errors anywhere ]")
-    for page in (alice, bob, mallory):
+    for page in (alice, bob, mallory, gatecrasher, host, heir):
         errors = await page.eval("return window.__errors || [];")
         check(f"{page.name}: no uncaught errors", not errors, "; ".join(errors or []))
 

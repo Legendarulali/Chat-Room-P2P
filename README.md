@@ -45,6 +45,7 @@ Environment variables:
 | `RENDER_EXTERNAL_URL` | unset | Public base URL. Sets the keep-alive target and flips the `HOST` default. Render exports it automatically; anywhere else, set it by hand. |
 | `DISCORD_WEBHOOK_URL` | unset | If set, keep-alive notices are posted to Discord. **This is the one thing that sends data off the machine** — see [below](#the-keep-alive-loop-is-the-one-thing-that-phones-home). |
 | `KEEPALIVE_INTERVAL_SECONDS` | `600` | Seconds between self-pings. Mainly a testing hook. |
+| `CAPACITY_CEILING` | `16` | Hard cap on what a host may set. Capacity comes from a client, so this is the bound that keeps it from being unlimited. |
 
 Note that `HOST` and `PORT` are deliberately unprefixed, which makes them
 generic: an unrelated `PORT` already exported in your shell will change the bind
@@ -190,6 +191,34 @@ which is what happens.
 
 ---
 
+## Room ownership and capacity
+
+**Whoever opens a room hosts it.** The first peer to reach a given room id gets
+the crown (👑 in the roster, amber name) and the only control panel in the app:
+a stepper for the room's size.
+
+- **Capacity is set at creation.** The joiner who creates the room supplies it;
+  the relay clamps it to `[2, CAPACITY_CEILING]` and defaults to 8. A later
+  joiner's requested capacity is ignored outright — otherwise anyone with the
+  passkey could overrule the host by reconnecting.
+- **Only the host can resize.** Anyone else asking gets `not_host` back, and
+  every occupant is told the new number via `room-meta`.
+- **Lowering never evicts anyone.** A decrease clamps at the current headcount.
+  Throwing people out of a conversation because a number moved would be a
+  hostile way to resize a room; the lower limit governs new joins instead.
+- **The crown is inherited, not lost.** When the host disconnects, the oldest
+  remaining peer becomes host and everyone is told. The stepper appears for
+  them and disappears for the peer who no longer has it.
+- **Rooms are still ephemeral, so hosting is too.** The room dies when the last
+  peer leaves, which means the next person to open that room id is its new host
+  and sets a fresh capacity. There is no persistent ownership, because there is
+  nothing persistent.
+
+Read [Host controls are not a security boundary](#what-this-does-not-protect-against)
+before treating any of this as enforcement.
+
+---
+
 ## The keep-alive loop is the one thing that phones home
 
 Free hosting tiers idle a service out when nothing calls it. A background task
@@ -265,12 +294,22 @@ paged to disk. The app avoids every storage API and sets `no-store` and a strict
 CSP, but "nothing is retained" is a server-side guarantee and a client-side
 best effort.
 
-**Eight peers, maximum.** In a full mesh each peer uploads its audio to every
-other peer, so upload and CPU cost grow with N. Past about eight, voice
-degrades. The server enforces the cap and refuses a ninth peer. Raising it means
-introducing an SFU, which puts a server back in the media path and gives up the
-architecture's main property. Text and files scale much further; the cap exists
-for voice.
+**Eight peers by default, sixteen at the absolute most.** In a full mesh each
+peer uploads its audio to every other peer, so cost grows with the square of the
+room. Past about eight, voice degrades — the host can raise the limit anyway,
+and the UI says what it costs when they do. `CAPACITY_CEILING` is the hard stop,
+because capacity arrives from a client and unbounded client-controlled state is
+how one room exhausts a process. Going genuinely large means an SFU, which puts
+a server back in the media path and gives up the architecture's main property.
+Text and files scale much further; the cap exists for voice.
+
+**Host controls are not a security boundary.** The relay assigns the host and
+enforces the cap, so a hostile relay could name the wrong peer host, ignore the
+limit, or admit a ninth guest. Host status is deliberately carried on the
+signaling channel rather than in encrypted peer frames — a peer could claim
+anything there, whereas the relay is at least the party that actually enforces
+it. Treat the crown as a way for a group to organise itself, not as a defence.
+What a hostile relay still cannot do is read a message.
 
 **No forward secrecy across a passkey's life.** The room key is a pure function
 of room name and passkey. Anyone who learns the passkey and captured earlier
@@ -326,7 +365,7 @@ through scale, weight, and tracking instead.
 
 ## Tests
 
-121 assertions across three suites. The first two need a live relay; start it
+178 assertions across three suites. The first two need a live relay; start it
 first:
 
 ```powershell
@@ -335,12 +374,14 @@ $env:DEBUG_STATS = "1"
 ```
 
 ```powershell
-# 57 assertions: protocol, validation, isolation, peer cap, room deletion,
-# rate limiting, security headers, /health shape, CORS, zero-storage grep
+# 88 assertions: protocol, validation, isolation, host assignment and
+# reassignment, custom capacity and its clamps, host-only resize, room
+# deletion, rate limiting, security headers, /health shape, CORS
 .venv\Scripts\python.exe tests\signaling_test.py
 
-# 41 assertions in two real headless browsers: key agreement, mesh formation,
-# encrypted chat, file integrity, voice tracks, mute/deafen, teardown
+# 67 assertions in two real headless browsers: key agreement, mesh formation,
+# encrypted chat, file integrity, voice tracks, mute/deafen, the crown and
+# host stepper, capacity refusal, crown inheritance, teardown
 .venv\Scripts\python.exe tests\browser_e2e_test.py
 ```
 
@@ -365,8 +406,9 @@ Client → relay:
 
 | Message | Meaning |
 | --- | --- |
-| `{"type":"join","room":"<64 hex>"}` | Enter a room. Answered with `welcome` or `error`. |
+| `{"type":"join","room":"<64 hex>","capacity":8}` | Enter a room. `capacity` is optional and only honoured if this join creates the room. Answered with `welcome` or `error`. |
 | `{"type":"signal","to":"<peerId>","data":{…}}` | Relay `data` verbatim to one peer in your room. |
+| `{"type":"set-capacity","capacity":10}` | Host only. Answered with a broadcast `room-meta`, or `not_host`. |
 | `{"type":"leave"}` | Disconnect. |
 | `{"type":"ping"}` | Answered with `pong`. |
 
@@ -374,11 +416,12 @@ Relay → client:
 
 | Message | Meaning |
 | --- | --- |
-| `{"type":"welcome","peerId","peers":[…],"limit":8}` | Admitted. `peers` lists who was already there. |
+| `{"type":"welcome","peerId","peers":[…],"hostId","capacity","ceiling","minCapacity"}` | Admitted. `peers` lists who was already there; `hostId` equals `peerId` if you opened the room. |
+| `{"type":"room-meta","hostId","capacity"}` | The host or the capacity changed. Sent on a resize and on host reassignment. |
 | `{"type":"peer-join","peerId"}` | Someone arrived. |
 | `{"type":"peer-leave","peerId"}` | Someone left. |
 | `{"type":"signal","from":"<peerId>","data":{…}}` | A relayed payload. |
-| `{"type":"error","code":"…"}` | `bad_room_id`, `room_full`, `not_joined`, `already_joined`, `no_such_peer`, `bad_json`, `bad_request`, `unknown_type`, `frame_too_large`, `rate_limited`. |
+| `{"type":"error","code":"…"}` | `bad_room_id`, `room_full`, `not_host`, `not_joined`, `already_joined`, `no_such_peer`, `bad_json`, `bad_request`, `unknown_type`, `frame_too_large`, `rate_limited`. |
 
 Inside `data`, peers exchange `{"kind":"desc","description":{…}}` and
 `{"kind":"ice","candidate":{…}}`. The relay does not parse either.
