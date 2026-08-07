@@ -458,6 +458,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+#: Extra origins for connect-src, space-separated. Needed only when this server
+#: serves the page but the client is configured (window.SIGNALING_URL) to reach a
+#: relay somewhere else -- otherwise connect-src 'self' blocks the socket and the
+#: browser reports it nowhere the user can see.
+#: e.g. EXTRA_CONNECT_SRC="wss://relay.example.com"
+EXTRA_CONNECT_SRC = os.environ.get("EXTRA_CONNECT_SRC", "").strip()
+
 # Tailwind is loaded from its CDN, so script-src has to name that host and
 # allow the inline config block it needs. Vendoring Tailwind (see README,
 # "Removing the CDN") lets this collapse to `default-src 'self'`.
@@ -468,7 +475,7 @@ CSP = "; ".join(
         "style-src 'self' 'unsafe-inline'",
         "img-src 'self' data: blob:",
         "media-src 'self' blob: mediastream:",
-        "connect-src 'self'",
+        f"connect-src 'self'{' ' + EXTRA_CONNECT_SRC if EXTRA_CONNECT_SRC else ''}",
         "font-src 'self'",
         "object-src 'none'",
         "base-uri 'none'",

@@ -45,6 +45,7 @@ Environment variables:
 | `RENDER_EXTERNAL_URL` | unset | Public base URL. Sets the keep-alive target and flips the `HOST` default. Render exports it automatically; anywhere else, set it by hand. |
 | `DISCORD_WEBHOOK_URL` | unset | If set, keep-alive notices are posted to Discord. **This is the one thing that sends data off the machine** — see [below](#the-keep-alive-loop-is-the-one-thing-that-phones-home). |
 | `KEEPALIVE_INTERVAL_SECONDS` | `600` | Seconds between self-pings. Mainly a testing hook. |
+| `EXTRA_CONNECT_SRC` | unset | Extra origins appended to this server's `connect-src`. Needed only when this server serves the page but the client signals to a different relay. |
 | `CAPACITY_CEILING` | `16` | Hard cap on what a host may set. Capacity comes from a client, so this is the bound that keeps it from being unlimited. |
 
 Note that `HOST` and `PORT` are deliberately unprefixed, which makes them
@@ -60,6 +61,59 @@ surprise locally.
 | `GET /api/health` | `{"ok": true}`. Older liveness probe, kept for the test suite. |
 | `GET /api/debug/stats` | Room and peer counts. Only mounted when `DEBUG_STATS=1`. |
 | `WS /ws` | Signaling. See [Protocol reference](#protocol-reference). |
+
+### Split deployment: static frontend, separate relay
+
+The default assumption is that the relay serves the page, so the client derives
+its websocket address from `location.host`. Put the page on a static host and
+that assumption breaks: Vercel has no `/ws`, so the client tries
+`wss://your-project.vercel.app/ws` and nothing connects.
+
+**One line fixes it.** In `client/index.html`, uncomment and set:
+
+```js
+window.SIGNALING_URL = 'wss://chat-room-p2p.onrender.com/ws';
+```
+
+Accepted forms — the scheme and `/ws` are filled in when omitted:
+
+| You write | Resolves to |
+| --- | --- |
+| `wss://relay.example.com/ws` | unchanged |
+| `wss://relay.example.com` | `wss://relay.example.com/ws` |
+| `relay.example.com` | `wss://relay.example.com/ws` (on an https page) |
+| `https://relay.example.com` | `wss://relay.example.com/ws` |
+
+Leave it unset and the client falls back to `FALLBACK_SIGNALING_URL` in
+`app.js` whenever the page is on a recognised static host (`*.vercel.app`,
+`*.netlify.app`, `*.github.io`, `*.pages.dev`, `*.surge.sh`). Local development
+is unaffected either way, since `127.0.0.1` is not one of those.
+
+The room's transport panel shows which relay is in use, with a `*` when it is
+not the page's own origin.
+
+#### The part that is easy to miss
+
+**`connect-src` has to allow the relay's origin, and the CSP comes from whoever
+serves the page — not from the relay.** Vercel would otherwise send no security
+headers at all, so `vercel.json` in the repo root reproduces every header
+`server/main.py` sets, with the relay added to `connect-src`:
+
+```
+connect-src 'self' wss://chat-room-p2p.onrender.com
+```
+
+Change that host when you change `SIGNALING_URL`, or the browser refuses the
+socket and reports it only to the console. Vercel also needs its **Output
+Directory** set to `client` — `vercel.json` declares it, but check the project
+settings if you get a 404.
+
+The reverse case: if the *relay* serves the page while the client points
+somewhere else, set `EXTRA_CONNECT_SRC="wss://other-relay.example.com"` so the
+relay's own CSP allows it.
+
+Note that WebSocket handshakes are not subject to CORS, so nothing extra is
+needed there — cross-origin signaling works without it.
 
 ### Web Crypto needs a secure context
 
@@ -90,6 +144,7 @@ client/app.js             crypto, mesh, protocol, audio, UI
 tests/signaling_test.py   black-box checks against a running relay
 tests/browser_e2e_test.py two headless browsers, driven over DevTools Protocol
 tests/keepalive_test.py   the self-ping loop and its Discord notice
+vercel.json               static-host headers for a split deployment
 ```
 
 No npm, no bundler, no build step. The client uses WebRTC, Web Crypto, and the
@@ -365,7 +420,7 @@ through scale, weight, and tracking instead.
 
 ## Tests
 
-178 assertions across three suites. The first two need a live relay; start it
+204 assertions across three suites. The first two need a live relay; start it
 first:
 
 ```powershell
@@ -379,9 +434,11 @@ $env:DEBUG_STATS = "1"
 # deletion, rate limiting, security headers, /health shape, CORS
 .venv\Scripts\python.exe tests\signaling_test.py
 
-# 67 assertions in two real headless browsers: key agreement, mesh formation,
+# 93 assertions in real headless browsers: key agreement, mesh formation,
 # encrypted chat, file integrity, voice tracks, mute/deafen, the crown and
-# host stepper, capacity refusal, crown inheritance, teardown
+# host stepper, capacity refusal, crown inheritance, teardown, and signaling
+# address resolution -- including a page served from a static host, to prove
+# it does not signal to its own origin
 .venv\Scripts\python.exe tests\browser_e2e_test.py
 ```
 

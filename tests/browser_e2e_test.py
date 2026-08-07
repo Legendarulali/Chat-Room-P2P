@@ -133,8 +133,10 @@ class Page:
 
 
 class Browser:
-    def __init__(self, binary: str) -> None:
+    def __init__(self, binary: str, port: int = DEBUG_PORT, extra_args: tuple[str, ...] = ()) -> None:
         self.binary = binary
+        self.port = port
+        self.extra_args = extra_args
         self.process: subprocess.Popen | None = None
         self.profile = tempfile.mkdtemp(prefix="chatroom-e2e-")
         self.browser_ws = None
@@ -145,8 +147,9 @@ class Browser:
             [
                 self.binary,
                 "--headless=new",
-                f"--remote-debugging-port={DEBUG_PORT}",
+                f"--remote-debugging-port={self.port}",
                 f"--user-data-dir={self.profile}",
+                *self.extra_args,
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-gpu",
@@ -165,7 +168,7 @@ class Browser:
         for _ in range(80):
             await asyncio.sleep(0.25)
             try:
-                with urllib.request.urlopen(f"http://127.0.0.1:{DEBUG_PORT}/json/version", timeout=2) as response:
+                with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json/version", timeout=2) as response:
                     endpoint = json.loads(response.read())["webSocketDebuggerUrl"]
                 break
             except Exception:  # noqa: BLE001 - browser not up yet
@@ -186,18 +189,22 @@ class Browser:
                     raise RuntimeError(f"{method}: {message['error']}")
                 return message.get("result", {})
 
-    async def open_page(self, name: str, url: str) -> Page:
+    async def open_page(self, name: str, url: str, preload: str = "") -> Page:
         # Open blank first so the error collector is installed before any of the
         # app's own script runs -- otherwise a boot-time throw would go unseen.
         result = await self._browser_call("Target.createTarget", {"url": "about:blank"})
         target_id = result["targetId"]
         ws = await websockets.connect(
-            f"ws://127.0.0.1:{DEBUG_PORT}/devtools/page/{target_id}", max_size=None
+            f"ws://127.0.0.1:{self.port}/devtools/page/{target_id}", max_size=None
         )
         page = Page(name, ws)
         await page.call("Runtime.enable")
         await page.call("Page.enable")
         await page.call("Page.addScriptToEvaluateOnNewDocument", {"source": ERROR_COLLECTOR})
+        if preload:
+            # Runs before app.js, which is the only point at which setting
+            # window.SIGNALING_URL has any effect.
+            await page.call("Page.addScriptToEvaluateOnNewDocument", {"source": preload})
         await page.call("Page.navigate", {"url": url})
 
         ready = await page.wait_for("document.readyState === 'complete'", seconds=25)
@@ -665,10 +672,155 @@ async def run(browser: Browser) -> None:
     check("the inherited stepper works", bool(works),
           await heir.eval("return document.getElementById('capacity-value').textContent;"))
 
+    print("\n[ signaling address resolution ]")
+    relay_row = await alice.eval("""
+        const rows = [...document.querySelectorAll('#transport > div')];
+        const row = rows.find(r => r.querySelector('dt')?.textContent === 'relay');
+        return row ? row.querySelector('dd').textContent : null;
+    """)
+    check("transport panel reports the relay host", relay_row is not None, str(relay_row))
+    check("same-origin relay is not flagged as external",
+          relay_row is not None and not relay_row.endswith("*"), str(relay_row))
+
+    # An explicitly configured address must be used verbatim, and must work.
+    configured = await browser.open_page(
+        "configured", f"{BASE_HTTP}/",
+        preload=f"window.SIGNALING_URL = 'ws://127.0.0.1:{BASE_HTTP.rsplit(':', 1)[1]}/ws';",
+    )
+    await configured.wait_for("document.getElementById('brand-seal')?.children.length === 16", seconds=20)
+    check("configured address does not block boot",
+          await configured.eval(
+              "return document.getElementById('join-error').classList.contains('hidden');"))
+    await join(configured, "frank")
+    check("a configured SIGNALING_URL connects", await in_room(configured))
+    configured_row = await configured.eval("""
+        const rows = [...document.querySelectorAll('#transport > div')];
+        const row = rows.find(r => r.querySelector('dt')?.textContent === 'relay');
+        return row ? row.querySelector('dd').textContent : null;
+    """)
+    check("configured relay is flagged as external",
+          configured_row is not None and configured_row.endswith("*"), str(configured_row))
+    await configured.eval("document.getElementById('leave-btn').click(); return true;")
+
+    # A bad address must name itself in the error rather than failing silently.
+    broken = await browser.open_page(
+        "broken", f"{BASE_HTTP}/",
+        preload="window.SIGNALING_URL = 'ws://127.0.0.1:9/ws';",
+    )
+    await broken.wait_for("document.getElementById('brand-seal')?.children.length === 16", seconds=20)
+    await join(broken, "grace")
+    told = await broken.wait_for("""
+        const box = document.getElementById('join-error');
+        return !box.classList.contains('hidden') ? box.textContent : false;
+    """, seconds=40)
+    check("unreachable relay is reported", bool(told), str(told))
+    check("the error names the address", "127.0.0.1:9" in str(told), str(told))
+    check("the error names the config knob", "SIGNALING_URL" in str(told), str(told))
+
+    # Bare host and https:// forms must normalise to a wss:// /ws endpoint.
+    forms = await alice.eval("""
+        const cases = ['example.com', 'example.com/ws', 'https://example.com',
+                       'wss://example.com/custom', 'ws://example.com'];
+        return JSON.stringify(cases.map(c => {
+            const u = normalizeSignalingUrl(c);
+            return u ? u.href : null;
+        }));
+    """)
+    normalised = json.loads(forms)
+    check("bare host normalises to /ws", normalised[0].endswith("://example.com/ws"), str(normalised[0]))
+    check("host with path is kept", normalised[1].endswith("/ws"), str(normalised[1]))
+    check("https:// becomes wss://", normalised[2].startswith("wss://"), str(normalised[2]))
+    check("an explicit path is preserved", normalised[3] == "wss://example.com/custom", str(normalised[3]))
+    check("ws:// is left as ws://", normalised[4].startswith("ws://"), str(normalised[4]))
+
     print("\n[ no page errors anywhere ]")
-    for page in (alice, bob, mallory, gatecrasher, host, heir):
+    for page in (alice, bob, mallory, gatecrasher, host, heir, configured, broken):
         errors = await page.eval("return window.__errors || [];")
         check(f"{page.name}: no uncaught errors", not errors, "; ".join(errors or []))
+
+
+async def run_static_host_check(binary: str) -> None:
+    """The reported Vercel bug, reproduced.
+
+    Chrome's host resolver is pointed at the local relay for a hostname ending
+    in .vercel.app, so the page really is served from a static-looking origin.
+    resolveSignalingUrl is then asked what it would do. No network is involved
+    beyond localhost, so this does not depend on any deployment existing.
+    """
+    print("\n[ a page on a static host must not signal to its own host ]")
+    port = BASE_HTTP.rsplit(":", 1)[1]
+    # Deliberately not *.vercel.app: .app is an HSTS-preloaded TLD, so Chrome
+    # force-upgrades it to https and a plain-http test page is impossible.
+    # .surge.sh is in the same STATIC_ONLY_HOSTS list and reachable over http,
+    # so it exercises the identical branch. That vercel.app is recognised is
+    # asserted separately below.
+    fake = "chat-room-p2p.surge.sh"
+    browser = Browser(
+        binary,
+        port=DEBUG_PORT + 1,
+        # MAP takes a host pattern and a replacement host; the URL's port is
+        # preserved, so it must not appear in the pattern.
+        extra_args=(f"--host-resolver-rules=MAP {fake} 127.0.0.1",),
+    )
+    try:
+        await browser.start()
+        page = await browser.open_page("static", f"http://{fake}:{port}/")
+        await page.wait_for("typeof resolveSignalingUrl === 'function'", seconds=25)
+
+        check("page really is on a static-host name",
+              await page.eval("return location.hostname;") == fake,
+              await page.eval("return location.hostname;"))
+
+        # The hostname from the bug report must be recognised by the same list.
+        recognised = json.loads(await page.eval("""
+            const hosts = ['chat-room-p2p.vercel.app', 'anything.netlify.app',
+                           'user.github.io', 'proj.pages.dev', 'x.surge.sh',
+                           '127.0.0.1', 'chat.example.com'];
+            return JSON.stringify(hosts.map(
+                h => [h, STATIC_ONLY_HOSTS.some(s => h.endsWith(s))]));
+        """))
+        by_host = dict(recognised)
+        check("chat-room-p2p.vercel.app is treated as a static host",
+              by_host["chat-room-p2p.vercel.app"] is True, str(by_host))
+        check("netlify, pages.dev and github.io too",
+              all(by_host[h] for h in ("anything.netlify.app", "user.github.io", "proj.pages.dev")),
+              str(by_host))
+        check("a real relay host is not misclassified",
+              by_host["127.0.0.1"] is False and by_host["chat.example.com"] is False, str(by_host))
+
+        resolved = json.loads(await page.eval("return JSON.stringify(resolveSignalingUrl());"))
+        check("static host is detected", resolved.get("source") == "fallback", str(resolved))
+        check("does NOT signal to its own host",
+              "vercel.app" not in str(resolved.get("url")), str(resolved))
+        check("falls back to the configured relay",
+              "chat-room-p2p.onrender.com" in str(resolved.get("url")), str(resolved))
+        check("fallback resolves to the /ws endpoint",
+              str(resolved.get("url")).endswith("/ws"), str(resolved))
+        check("no error on the fallback path", resolved.get("error") is None, str(resolved))
+
+        # An explicit override must still beat the fallback on a static host.
+        overridden = json.loads(await page.eval("""
+            window.SIGNALING_URL = 'wss://relay.example.org/ws';
+            const r = resolveSignalingUrl();
+            delete window.SIGNALING_URL;
+            return JSON.stringify(r);
+        """))
+        check("SIGNALING_URL overrides the fallback",
+              overridden.get("source") == "configured"
+              and overridden.get("url") == "wss://relay.example.org/ws", str(overridden))
+
+        # And a same-origin override on a static host must be called out.
+        self_pointed = json.loads(await page.eval(f"""
+            window.SIGNALING_URL = 'ws://{fake}:{port}/ws';
+            const r = resolveSignalingUrl();
+            delete window.SIGNALING_URL;
+            return JSON.stringify(r);
+        """))
+        check("pointing a static host at itself is refused with an explanation",
+              bool(self_pointed.get("error")) and "only serves files" in str(self_pointed.get("error")),
+              str(self_pointed))
+    finally:
+        await browser.stop()
 
 
 async def main() -> int:
@@ -689,11 +841,19 @@ async def main() -> int:
     try:
         await browser.start()
         await run(browser)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - report and keep going
         failed.append("harness")
         print(f"\n  ERROR {type(exc).__name__}: {exc}")
     finally:
         await browser.stop()
+
+    # Runs in its own browser: it needs host-resolver rules the main instance
+    # must not have, since they would rewrite every other page's origin.
+    try:
+        await run_static_host_check(binary)
+    except Exception as exc:  # noqa: BLE001 - report and keep going
+        failed.append("static-host-harness")
+        print(f"\n  ERROR {type(exc).__name__}: {exc}")
 
     print(f"\n{'=' * 58}")
     print(f"{len(passed)} passed, {len(failed)} failed")

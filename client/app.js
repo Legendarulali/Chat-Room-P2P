@@ -72,6 +72,21 @@ const ICE_SERVERS = [
   { urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] },
 ];
 
+/* Used when the page is served from a static host, which cannot itself be the
+   relay. Override per-deployment with window.SIGNALING_URL in index.html rather
+   than editing this. */
+const FALLBACK_SIGNALING_URL = 'wss://chat-room-p2p.onrender.com/ws';
+
+/* Hosts that serve files and nothing else, so the page's own origin is never a
+   relay. Matched as suffixes against location.hostname. */
+const STATIC_ONLY_HOSTS = [
+  '.vercel.app',
+  '.netlify.app',
+  '.github.io',
+  '.pages.dev',
+  '.surge.sh',
+];
+
 /** Frame types on the encrypted channel. */
 const F = {
   HELLO: 1,
@@ -261,6 +276,10 @@ const state = {
   capacity: DEFAULT_CAPACITY,
   ceiling: DEFAULT_CEILING,
   minCapacity: MIN_CAPACITY,
+  // Resolved once at boot so the join screen can report a misconfiguration
+  // before anyone spends a second on key derivation.
+  signalingUrl: '',
+  signalingSource: '',
   socket: null,
   peers: new Map(),      // peerId -> Peer
   incoming: new Map(),   // transferId -> { from, meta, parts, received }
@@ -284,9 +303,90 @@ const audio = {
    5. Signaling
    ========================================================================== */
 
-function relayUrl() {
-  const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${scheme}//${location.host}/ws`;
+/**
+ * Work out where the relay lives.
+ *
+ * Same-origin is the right answer whenever the page came from the relay itself,
+ * which covers local development and a single-host deploy. It is the wrong
+ * answer on a static host: Vercel and friends serve files and have no websocket
+ * endpoint, so deriving the URL from location.host points the client at a /ws
+ * that does not exist.
+ *
+ * Priority:
+ *   1. window.SIGNALING_URL, set in index.html. Always wins.
+ *   2. FALLBACK_SIGNALING_URL, when the page is on a known static host.
+ *   3. Same origin as the page.
+ *
+ * Returns { url, source, error }. `error` is a human-readable reason the
+ * resolved URL cannot work, which is better than letting the browser refuse the
+ * connection with nothing but a console message.
+ */
+function resolveSignalingUrl() {
+  const override = typeof window.SIGNALING_URL === 'string' ? window.SIGNALING_URL.trim() : '';
+  const onStaticHost = STATIC_ONLY_HOSTS.some((suffix) => location.hostname.endsWith(suffix));
+
+  let raw;
+  let source;
+  if (override) {
+    raw = override;
+    source = 'configured';
+  } else if (onStaticHost) {
+    raw = FALLBACK_SIGNALING_URL;
+    source = 'fallback';
+  } else {
+    raw = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`;
+    source = 'same-origin';
+  }
+
+  const url = normalizeSignalingUrl(raw);
+  if (!url) {
+    return { url: null, source, error: `Could not read "${raw}" as a signaling address.` };
+  }
+
+  // A secure page cannot open an insecure socket; the browser blocks it outright.
+  if (location.protocol === 'https:' && url.protocol === 'ws:') {
+    return {
+      url: url.href,
+      source,
+      error: `This page is on https, so the relay address must use wss://, not ws:// (${url.href}).`,
+    };
+  }
+  if (onStaticHost && url.host === location.host) {
+    return {
+      url: url.href,
+      source,
+      error: `${location.hostname} only serves files, so it has no relay. `
+        + 'Set window.SIGNALING_URL in index.html to your relay address.',
+    };
+  }
+  return { url: url.href, source, error: null };
+}
+
+/**
+ * Accept the forms someone would plausibly write: a full wss:// URL, an
+ * https:// URL, a bare host, or a host with a path. Fills in /ws when no path
+ * is given, since that is the only endpoint there is.
+ */
+function normalizeSignalingUrl(raw) {
+  let value = String(raw || '').trim();
+  if (!value) return null;
+
+  if (/^https:\/\//i.test(value)) value = value.replace(/^https:\/\//i, 'wss://');
+  else if (/^http:\/\//i.test(value)) value = value.replace(/^http:\/\//i, 'ws://');
+  else if (!/^wss?:\/\//i.test(value)) {
+    value = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${value}`;
+  }
+
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (!url.hostname) return null;
+  if (url.pathname === '/' || url.pathname === '') url.pathname = '/ws';
+  url.hash = '';
+  return url;
 }
 
 function sendToRelay(message) {
@@ -300,7 +400,13 @@ function sendToRelay(message) {
 function connectRelay(roomId, requestedCapacity) {
   return new Promise((resolve, reject) => {
     let settled = false;
-    const sock = new WebSocket(relayUrl());
+    let sock;
+    try {
+      sock = new WebSocket(state.signalingUrl);
+    } catch {
+      reject(new Error('relay_unreachable'));
+      return;
+    }
     state.socket = sock;
 
     // Capacity is a request, not an instruction: the relay honours it only when
@@ -1198,6 +1304,17 @@ function renderTransport() {
   }
   rows.push(['cipher', 'AES-GCM-256', 'var(--wire)']);
   rows.push(['store', 'none', 'var(--signal)']);
+  // Where signaling actually went. On a split deploy this is the first thing
+  // you want to see when nothing connects.
+  if (state.signalingUrl) {
+    let relayHost = state.signalingUrl;
+    try { relayHost = new URL(state.signalingUrl).host; } catch { /* show it raw */ }
+    rows.push([
+      'relay',
+      relayHost + (state.signalingSource === 'same-origin' ? '' : ' *'),
+      state.signalingSource === 'same-origin' ? 'var(--muted)' : 'var(--wire)',
+    ]);
+  }
 
   for (const [key, value, color] of rows) {
     const row = document.createElement('div');
@@ -1407,10 +1524,23 @@ function joinError(text) {
 
 const RELAY_ERRORS = {
   room_full: 'That room is full. Its host sets the limit, so ask them to raise it.',
-  relay_unreachable: "Can't reach the signaling relay. Check that the server is running.",
   bad_room_id: 'The relay rejected the room identifier. Reload and try again.',
   rate_limited: 'The relay rate-limited this connection. Wait a moment and rejoin.',
 };
+
+/** Naming the address is the difference between a fixable error and a mystery. */
+function unreachableMessage() {
+  const where = state.signalingUrl || '(no address resolved)';
+  if (state.signalingSource === 'fallback') {
+    return `Can't reach the relay at ${where}. That address is this build's default `
+      + 'for static hosting — set window.SIGNALING_URL in index.html to point at your own relay.';
+  }
+  if (state.signalingSource === 'configured') {
+    return `Can't reach the relay at ${where}, which is the window.SIGNALING_URL `
+      + 'configured in index.html. Check the address and that the relay is running.';
+  }
+  return `Can't reach the relay at ${where}. Check that the server is running.`;
+}
 
 async function join(roomName, passkey, nick, wantMic, requestedCapacity) {
   $('join-btn').disabled = true;
@@ -1455,7 +1585,11 @@ async function join(roomName, passkey, nick, wantMic, requestedCapacity) {
   } catch (err) {
     state.roomKey = null;
     state.seal = null;
-    joinError(RELAY_ERRORS[err.message] || 'The relay refused the connection.');
+    joinError(
+      err.message === 'relay_unreachable'
+        ? unreachableMessage()
+        : RELAY_ERRORS[err.message] || 'The relay refused the connection.',
+    );
     return;
   }
 
@@ -1713,7 +1847,22 @@ function boot() {
     return;
   }
 
+  // Resolve the relay address now. Finding out it is wrong after 600 000 PBKDF2
+  // iterations is a worse experience than finding out before the form is usable.
+  const signaling = resolveSignalingUrl();
+  state.signalingUrl = signaling.url || '';
+  state.signalingSource = signaling.source;
+
   wireEvents();
+
+  if (signaling.error) {
+    // Not fatal: the address is configuration, and someone may want to read the
+    // page anyway. But say so up front rather than at submit time.
+    joinError(signaling.error);
+    $('join-btn').disabled = true;
+    return;
+  }
+
   $('f-room').focus();
 }
 

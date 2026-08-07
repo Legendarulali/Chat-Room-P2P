@@ -8,6 +8,35 @@
 <title>Chat Room P2P — ephemeral encrypted rooms</title>
 
 <!--
+  ============================================================================
+  DEPLOYMENT CONFIG — the one thing you edit per environment.
+  ============================================================================
+
+  Leave SIGNALING_URL commented out when the relay serves this page itself,
+  which is the case for local development and any single-host deploy. The client
+  then uses this page's own origin.
+
+  Uncomment and set it when the page is served from somewhere the relay is not —
+  a static host like Vercel, Netlify, or GitHub Pages. Accepted forms:
+
+      wss://chat-room-p2p.onrender.com/ws     explicit, preferred
+      wss://chat-room-p2p.onrender.com        /ws is filled in
+      chat-room-p2p.onrender.com              scheme is filled in
+
+  Two things to get right, or the browser silently refuses the socket:
+    * On an https page the address must be wss://, never ws://.
+    * Whatever serves this page must allow that host in its Content-Security-
+      Policy connect-src. See vercel.json in the repo root for a working
+      example, and README → "Split deployment".
+
+  With this left unset, a page on a known static host falls back to
+  FALLBACK_SIGNALING_URL in app.js instead of pointing at its own origin.
+-->
+<script>
+  // window.SIGNALING_URL = 'wss://chat-room-p2p.onrender.com/ws';
+</script>
+
+<!--
   Tailwind is loaded from its CDN because the build brief asks for it. Note the
   trade-off: this is the one third-party request the page makes, so the CDN host
   learns your IP and the fact that you loaded this page (not who you talked to,
