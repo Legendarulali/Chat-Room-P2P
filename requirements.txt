@@ -1,0 +1,8 @@
+# EnDa Chat — signaling relay.
+#
+# That is the whole dependency list. The client uses no npm packages and no
+# JavaScript libraries: WebRTC, Web Crypto, and the DOM are all browser-native.
+# (Tailwind arrives from its CDN at runtime — see README, "Removing the CDN".)
+
+fastapi>=0.115
+uvicorn[standard]>=0.34
