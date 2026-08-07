@@ -823,6 +823,149 @@ async def run_static_host_check(binary: str) -> None:
         await browser.stop()
 
 
+async def run_reconnect_check(binary: str) -> None:
+    """Kill the relay under two live clients and watch them come back.
+
+    This uses a relay of its own so it can be restarted, which is the only
+    reliable way to sever an established websocket here: CDP's offline emulation
+    leaves loopback connections alone, so it drops nothing.
+
+    It is the production case that matters -- a free tier waking up, a redeploy,
+    a dropped mobile link -- and the thing being checked is that each client
+    rebuilds rather than accumulating a second copy of everyone.
+    """
+    print("\n[ the relay restarts under two live clients ]")
+
+    import socket as _socket
+
+    def free_port() -> int:
+        with _socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    python = os.path.join(repo, ".venv", "Scripts", "python.exe")
+    if not os.path.isfile(python):
+        python = os.path.join(repo, ".venv", "bin", "python")
+
+    port = free_port()
+    base = f"http://127.0.0.1:{port}"
+
+    def start_relay() -> subprocess.Popen:
+        env = dict(os.environ)
+        env.update({"HOST": "127.0.0.1", "PORT": str(port), "PYTHONUNBUFFERED": "1"})
+        env.pop("DEBUG_STATS", None)
+        return subprocess.Popen(
+            [python, "-m", "server.main"], cwd=repo, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    async def wait_up(timeout: float = 30.0) -> bool:
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                with urllib.request.urlopen(f"{base}/health", timeout=2) as r:
+                    if r.status == 200:
+                        return True
+            except Exception:  # noqa: BLE001 - not up yet
+                await asyncio.sleep(0.3)
+        return False
+
+    relay = start_relay()
+    browser = Browser(binary, port=DEBUG_PORT + 2)
+    try:
+        check("test relay started", await wait_up())
+        await browser.start()
+
+        one = await browser.open_page("one", f"{base}/")
+        two = await browser.open_page("two", f"{base}/")
+        for page in (one, two):
+            await page.wait_for("document.getElementById('brand-seal')?.children.length === 16", seconds=25)
+
+        await join(one, "ivy")
+        check("ivy joined", await in_room(one))
+        await join(two, "jonas")
+        check("jonas joined", await in_room(two))
+
+        formed = await one.wait_for(
+            "document.getElementById('transport').textContent.includes('1/1 connected')", seconds=60)
+        check("mesh formed before the restart", bool(formed))
+
+        # Down it goes.
+        relay.terminate()
+        try:
+            relay.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            relay.kill()
+
+        dropped = await one.wait_for("""
+            return [...document.querySelectorAll('#log .msg-body')]
+                .some(n => /lost the connection/i.test(n.textContent)) ? 'yes' : false;
+        """, seconds=45)
+        check("ivy notices the relay went away", dropped == "yes",
+              await one.eval("return document.getElementById('status-text').textContent;"))
+
+        torn = await one.wait_for(
+            "document.getElementById('peer-count').textContent === '1/8'", seconds=30)
+        check("ivy tears the stale mesh down", bool(torn),
+              await one.eval("return document.getElementById('peer-count').textContent;"))
+
+        empty_roster = await one.eval("""
+            return [...document.querySelectorAll('#peer-list li')].length;
+        """)
+        check("only ivy is left in her roster", empty_roster == 1, str(empty_roster))
+
+        # And back up.
+        relay = start_relay()
+        check("test relay restarted", await wait_up())
+
+        recovered = await one.wait_for("""
+            return [...document.querySelectorAll('#log .msg-body')]
+                .some(n => /reconnected/i.test(n.textContent)) ? 'yes' : false;
+        """, seconds=120)
+        check("ivy reconnects unattended", recovered == "yes",
+              await one.eval("return document.getElementById('status-text').textContent;"))
+
+        settled = await one.wait_for(
+            "document.getElementById('peer-count').textContent === '2/8'", seconds=120)
+        check("the room settles back to two people", bool(settled),
+              await one.eval("return document.getElementById('peer-count').textContent;"))
+
+        # The ghost check: exactly one of each person, not two.
+        duplicates = await one.eval("""
+            const names = [...document.querySelectorAll('#peer-list li')]
+                .map(li => li.querySelector('p')?.textContent.trim());
+            const jonas = names.filter(n => n && n.includes('jonas')).length;
+            return JSON.stringify({ names, jonas });
+        """)
+        counts = json.loads(duplicates)
+        check("no duplicate jonas after the reconnect", counts["jonas"] == 1, str(counts))
+
+        remade = await one.wait_for(
+            "document.getElementById('transport').textContent.includes('1/1 connected')", seconds=120)
+        check("the mesh re-forms", bool(remade))
+
+        await send_chat(two, "back after the restart")
+        delivered = await one.wait_for("""
+            return [...document.querySelectorAll('#log .msg-body')]
+                .some(n => n.textContent.includes('after the restart')) ? 'yes' : false;
+        """, seconds=60)
+        check("encrypted chat works again", delivered == "yes")
+
+        for page in (one, two):
+            errors = await page.eval("return window.__errors || [];")
+            check(f"{page.name}: no uncaught errors through the outage", not errors,
+                  "; ".join(errors or []))
+    finally:
+        await browser.stop()
+        if relay.poll() is None:
+            relay.terminate()
+            try:
+                relay.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                relay.kill()
+
+
 async def main() -> int:
     try:
         urllib.request.urlopen(f"{BASE_HTTP}/api/health", timeout=3).close()
@@ -853,6 +996,14 @@ async def main() -> int:
         await run_static_host_check(binary)
     except Exception as exc:  # noqa: BLE001 - report and keep going
         failed.append("static-host-harness")
+        print(f"\n  ERROR {type(exc).__name__}: {exc}")
+
+    # Its own relay as well as its own browser, because it restarts the relay --
+    # which nothing else running against the shared one could survive.
+    try:
+        await run_reconnect_check(binary)
+    except Exception as exc:  # noqa: BLE001 - report and keep going
+        failed.append("reconnect-harness")
         print(f"\n  ERROR {type(exc).__name__}: {exc}")
 
     print(f"\n{'=' * 58}")

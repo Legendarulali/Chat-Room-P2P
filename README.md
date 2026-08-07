@@ -274,6 +274,43 @@ before treating any of this as enforcement.
 
 ---
 
+## Reconnects and ghost peers
+
+A dropped signaling socket used to be terminal. Now the client rebuilds:
+
+- **The mesh is torn down first.** Every `RTCPeerConnection` is closed, remote
+  audio detached, partial transfers dropped, and the roster cleared before any
+  rejoin attempt. A half-live mesh whose members can no longer learn about each
+  other is worse than a clean restart.
+- **Then it rejoins,** with exponential backoff and jitter (1s doubling to 15s,
+  eight attempts) so a relay restart does not bring every client back in the
+  same instant.
+- **The room key is kept.** Reconnecting does not re-derive anything or ask for
+  the passkey again; PBKDF2 runs once per session.
+
+### Why a reconnect used to double the room
+
+Each connection gets a fresh peer id, so a client that reconnected appeared
+beside its own previous entry, and the room inflated — `1/6` becoming `6/6` as a
+phone changed network a few times — until the stale socket finally timed out.
+
+The fix is a **session id**: 16 random bytes generated per page load, sent with
+`join`. If a room already holds that session, the relay evicts the earlier entry
+*before* the capacity check, so a reconnecting peer reclaims its own slot instead
+of competing with its ghost for the last one. A reconnecting host also keeps the
+crown rather than handing it away for the length of a network blip.
+
+The session id is random per page load, never persisted, and not derived from
+anything identifying. It does let the relay link a reconnect to a prior
+connection for as long as the room lives — that is the metadata cost of not
+counting people twice.
+
+`peer-leave` is announced exactly once per departure: eviction broadcasts it, and
+the evicted socket's own teardown then suppresses the duplicate rather than
+telling the room a second time.
+
+---
+
 ## The keep-alive loop is the one thing that phones home
 
 Free hosting tiers idle a service out when nothing calls it. A background task
@@ -326,11 +363,20 @@ Read this part. Every one of these is a real limitation, not a hypothetical.
 **Peers learn each other's IP addresses.** This is inherent to peer-to-peer:
 direct connections are exactly what keeps the server out of your conversation,
 and the cost is that the people in your room see your address. Encryption does
-not change it. Routing through a TURN relay would hide peers from each other,
-but it hands both addresses to the relay operator instead — a different trust
-assumption, not a smaller one. This app ships with STUN only and discloses IP
-visibility on the join screen. The transport panel shows `direct` or `relayed`
-so you always know which you got.
+not change it. The transport panel shows `direct` or `relayed`, so you always
+know which you got.
+
+**A TURN relay is used as a fallback, and it sees both addresses.** Two peers
+behind symmetric NAT — the ordinary case for 4G/5G carrier-grade NAT against
+home wifi — cannot connect directly at all, so the app falls back to relaying
+through TURN. ICE prefers direct paths, so this only happens when nothing else
+works, but when it does a third party carries your traffic and observes both
+endpoints. It **cannot read anything**: what passes through is DTLS, and inside
+that, AES-GCM frames it has no key for. The default servers use the public
+OpenRelay credentials, which are shared, rate-limited, and not guaranteed to be
+up; set `window.ICE_SERVERS` in `index.html` to use your own coturn instead. To
+refuse relaying entirely, set `window.ICE_SERVERS` to STUN-only entries and
+accept that some pairs will not connect.
 
 **The relay sees metadata.** Even knowing nothing about content, it observes:
 which IPs connected, when, how long they stayed, which opaque room id they
@@ -420,7 +466,7 @@ through scale, weight, and tracking instead.
 
 ## Tests
 
-204 assertions across three suites. The first two need a live relay; start it
+235 assertions across three suites. The first two need a live relay; start it
 first:
 
 ```powershell
@@ -429,16 +475,17 @@ $env:DEBUG_STATS = "1"
 ```
 
 ```powershell
-# 88 assertions: protocol, validation, isolation, host assignment and
-# reassignment, custom capacity and its clamps, host-only resize, room
-# deletion, rate limiting, security headers, /health shape, CORS
+# 104 assertions: protocol, validation, isolation, host assignment and
+# reassignment, custom capacity and its clamps, host-only resize, reconnect
+# session replacement, room deletion, rate limiting, security headers, CORS
 .venv\Scripts\python.exe tests\signaling_test.py
 
-# 93 assertions in real headless browsers: key agreement, mesh formation,
+# 108 assertions in real headless browsers: key agreement, mesh formation,
 # encrypted chat, file integrity, voice tracks, mute/deafen, the crown and
 # host stepper, capacity refusal, crown inheritance, teardown, and signaling
 # address resolution -- including a page served from a static host, to prove
-# it does not signal to its own origin
+# it does not signal to its own origin, and a relay restart under two live
+# clients to prove they rebuild without duplicating each other
 .venv\Scripts\python.exe tests\browser_e2e_test.py
 ```
 
@@ -463,7 +510,7 @@ Client → relay:
 
 | Message | Meaning |
 | --- | --- |
-| `{"type":"join","room":"<64 hex>","capacity":8}` | Enter a room. `capacity` is optional and only honoured if this join creates the room. Answered with `welcome` or `error`. |
+| `{"type":"join","room":"<64 hex>","capacity":8,"sessionId":"<32 hex>"}` | Enter a room. `capacity` is optional and only honoured if this join creates the room. `sessionId` is optional; when it matches an existing occupant the relay treats this as a reconnect and evicts the older entry. Answered with `welcome` or `error`. |
 | `{"type":"signal","to":"<peerId>","data":{…}}` | Relay `data` verbatim to one peer in your room. |
 | `{"type":"set-capacity","capacity":10}` | Host only. Answered with a broadcast `room-meta`, or `not_host`. |
 | `{"type":"leave"}` | Disconnect. |

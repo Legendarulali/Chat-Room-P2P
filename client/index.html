@@ -32,8 +32,24 @@
   With this left unset, a page on a known static host falls back to
   FALLBACK_SIGNALING_URL in app.js instead of pointing at its own origin.
 -->
+  ICE_SERVERS, below, replaces the built-in STUN + TURN list wholesale. The
+  defaults use the public OpenRelay credentials, which are shared by everyone
+  who uses them and therefore rate-limited and not guaranteed to be up. Point
+  this at your own coturn or a paid TURN service for anything you depend on.
+  Note that a TURN relay sees both peers' IP addresses; it cannot read anything,
+  because what it carries is AES-GCM ciphertext it has no key for.
+-->
 <script>
   // window.SIGNALING_URL = 'wss://chat-room-p2p.onrender.com/ws';
+
+  // window.ICE_SERVERS = [
+  //   { urls: 'stun:stun.l.google.com:19302' },
+  //   {
+  //     urls: ['turn:turn.example.com:3478', 'turns:turn.example.com:5349'],
+  //     username: 'your-user',
+  //     credential: 'your-secret',
+  //   },
+  // ];
 </script>
 
 <!--

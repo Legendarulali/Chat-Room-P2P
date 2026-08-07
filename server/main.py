@@ -54,6 +54,7 @@ import urllib.request
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -195,6 +196,29 @@ DISCORD_EMBED_COLOR = 0x4ADE9B
 # In-memory room registry
 # ---------------------------------------------------------------------------
 
+#: A client-generated session id. Bounded and format-checked because it becomes
+#: a dictionary key: anything else is ignored rather than stored.
+SESSION_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
+
+def clean_session_id(value: object) -> str | None:
+    if isinstance(value, str) and SESSION_ID_PATTERN.match(value):
+        return value
+    return None
+
+
+class JoinResult(NamedTuple):
+    """What a successful join produced, including anything it displaced."""
+
+    peer_id: str
+    existing: list[str]
+    host_id: str
+    capacity: int
+    #: Set when this join replaced an earlier connection from the same session.
+    replaced_id: str | None
+    replaced_ws: WebSocket | None
+
+
 class Room:
     """One live room: its occupants, its capacity, and which peer hosts it.
 
@@ -206,14 +230,21 @@ class Room:
 
     Host order follows insertion order, which dicts preserve, so "the next peer
     in line" is simply the oldest remaining one.
+
+    `sessions` maps a client-generated session id to the peer id currently
+    holding it, which is what lets a reconnect replace its own previous entry
+    instead of appearing beside it. Without it, a phone that changes network
+    reappears as a second occupant and the room inflates until the stale socket
+    times out. Session ids are random per page load and never persisted.
     """
 
-    __slots__ = ("peers", "capacity", "host_id")
+    __slots__ = ("peers", "capacity", "host_id", "sessions")
 
     def __init__(self, capacity: int) -> None:
         self.peers: dict[str, WebSocket] = {}
         self.capacity = capacity
         self.host_id: str | None = None
+        self.sessions: dict[str, str] = {}
 
 
 class Rooms:
@@ -229,13 +260,18 @@ class Rooms:
         self._lock = asyncio.Lock()
 
     async def join(
-        self, room_id: str, ws: WebSocket, requested_capacity: object
-    ) -> tuple[str, list[str], str, int] | None:
-        """Insert `ws`. Returns (peer_id, existing_ids, host_id, capacity), or None if full.
+        self, room_id: str, ws: WebSocket, requested_capacity: object, session_id: str | None
+    ) -> JoinResult | None:
+        """Insert `ws`. Returns a JoinResult, or None if the room is full.
 
         The requested capacity is honoured only when this call creates the room.
         A later joiner cannot talk the room into a different size -- otherwise
         anyone with the passkey could overrule the host just by reconnecting.
+
+        A session id that is already in the room means this is a reconnect, not
+        a new arrival. The previous entry is evicted *before* the capacity check,
+        so a phone hopping from wifi to 5G reclaims its own slot rather than
+        competing with its own ghost for the last one.
         """
         async with self._lock:
             room = self._rooms.get(room_id)
@@ -243,43 +279,77 @@ class Rooms:
                 room = Room(clamp_capacity(requested_capacity))
                 self._rooms[room_id] = room
 
+            replaced_id: str | None = None
+            replaced_ws: WebSocket | None = None
+            inherits_host = False
+            if session_id and session_id in room.sessions:
+                replaced_id = room.sessions.pop(session_id)
+                replaced_ws = room.peers.pop(replaced_id, None)
+                # A host that reconnects keeps the crown rather than handing it
+                # to someone else for the length of a network blip.
+                inherits_host = room.host_id == replaced_id
+
             if len(room.peers) >= room.capacity:
                 if not room.peers:
                     # Refused into an empty room we just made; do not leave it behind.
-                    del self._rooms[room_id]
+                    self._rooms.pop(room_id, None)
                 return None
 
             peer_id = secrets.token_hex(8)
             existing = list(room.peers.keys())
             room.peers[peer_id] = ws
-            if room.host_id is None:
-                # First peer through the door hosts the room.
+            if session_id:
+                room.sessions[session_id] = peer_id
+            if room.host_id is None or inherits_host:
+                # First peer through the door hosts the room, and a reconnecting
+                # host resumes hosting it.
                 room.host_id = peer_id
-            return peer_id, existing, room.host_id, room.capacity
 
-    async def leave(self, room_id: str, peer_id: str) -> tuple[list[WebSocket], str | None, int]:
+            return JoinResult(
+                peer_id=peer_id,
+                existing=existing,
+                host_id=room.host_id,
+                capacity=room.capacity,
+                replaced_id=replaced_id,
+                replaced_ws=replaced_ws,
+            )
+
+    async def leave(
+        self, room_id: str, peer_id: str
+    ) -> tuple[list[WebSocket], str | None, int, bool]:
         """Remove a peer.
 
-        Returns (remaining sockets, new host id if it changed, capacity).
-        Drops the room entirely when the last peer goes.
+        Returns (remaining sockets, new host id if it changed, capacity, removed).
+
+        `removed` is False when this peer was already gone, which happens when a
+        reconnect evicted it: the socket still runs its own teardown afterwards,
+        and announcing the departure twice would tell the room a peer left that
+        it has already been told about -- including telling the reconnected peer
+        that its own former id left.
         """
         async with self._lock:
             room = self._rooms.get(room_id)
             if room is None:
-                return [], None, MAX_PEERS_PER_ROOM
-            room.peers.pop(peer_id, None)
+                return [], None, MAX_PEERS_PER_ROOM, False
+            removed = room.peers.pop(peer_id, None) is not None
+            # Drop this peer's session mapping too, but only if it still points
+            # here: a reconnect has already repointed it at the new peer id, and
+            # clearing that would undo the replacement.
+            for session, holder in list(room.sessions.items()):
+                if holder == peer_id:
+                    del room.sessions[session]
 
             if not room.peers:
                 # Last peer out: the room and every trace of it go away now.
                 del self._rooms[room_id]
-                return [], None, room.capacity
+                return [], None, room.capacity, removed
 
             new_host = None
             if room.host_id == peer_id:
                 # Hand the crown to the oldest remaining peer.
                 room.host_id = next(iter(room.peers))
                 new_host = room.host_id
-            return list(room.peers.values()), new_host, room.capacity
+            return list(room.peers.values()), new_host, room.capacity, removed
 
     async def set_capacity(self, room_id: str, peer_id: str, value: object) -> tuple[int, list[WebSocket]] | None:
         """Host-only capacity change. Returns (applied capacity, sockets) or None if refused.
@@ -603,14 +673,33 @@ async def signaling(ws: WebSocket) -> None:
                     await _close(ws, code=1008)
                     return
 
-                result = await rooms.join(requested, ws, message.get("capacity"))
+                result = await rooms.join(
+                    requested,
+                    ws,
+                    message.get("capacity"),
+                    clean_session_id(message.get("sessionId")),
+                )
                 if result is None:
                     await _send(ws, {"type": "error", "code": "room_full"})
                     await _close(ws, code=1013)
                     return
 
-                peer_id, existing, host_id, capacity = result
+                peer_id, existing, host_id, capacity = (
+                    result.peer_id, result.existing, result.host_id, result.capacity,
+                )
                 room_id = requested
+
+                # Tell the room the old connection is gone before announcing the
+                # new one, so nobody briefly sees the same person twice.
+                if result.replaced_id is not None:
+                    await _broadcast(
+                        [sock for pid, sock in (await rooms.peers(room_id)).items() if pid != peer_id],
+                        {"type": "peer-leave", "peerId": result.replaced_id},
+                    )
+                    if result.replaced_ws is not None:
+                        # 1012 "service restart" reads as "reconnect happened
+                        # elsewhere" rather than as an error on this socket.
+                        await _close(result.replaced_ws, code=1012)
                 await _send(
                     ws,
                     {
@@ -696,8 +785,9 @@ async def signaling(ws: WebSocket) -> None:
         pass
     finally:
         if room_id is not None and peer_id is not None:
-            remaining, new_host, capacity = await rooms.leave(room_id, peer_id)
-            await _broadcast(remaining, {"type": "peer-leave", "peerId": peer_id})
+            remaining, new_host, capacity, removed = await rooms.leave(room_id, peer_id)
+            if removed:
+                await _broadcast(remaining, {"type": "peer-leave", "peerId": peer_id})
             if new_host is not None:
                 # The host left. Tell everyone who holds the crown now, before
                 # any of them try to use a control they no longer have (or do

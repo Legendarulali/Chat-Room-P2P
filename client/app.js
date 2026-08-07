@@ -60,17 +60,75 @@ const MAX_FILE_BYTES = 100 * 1024 * 1024;
 const DC_HIGH_WATER = 1024 * 1024;
 const DC_LOW_WATER = 256 * 1024;
 
-/** A peer that has not sent a decryptable frame by now does not know the passkey. */
-const VERIFY_TIMEOUT_MS = 12_000;
+/**
+ * How long a peer has to prove it holds the room key, counted from the moment
+ * its DataChannel opens -- not from when we learned it existed.
+ *
+ * The old version started this clock at peer creation, so ICE gathering and
+ * connection ate the budget. A phone on 5G negotiating through TURN could spend
+ * longer than that just getting a channel, and then be dropped for "never
+ * proved they hold the room key" without ever having had the chance. Once a
+ * channel is open, HELLO is one frame, so this only has to cover latency.
+ */
+const VERIFY_TIMEOUT_MS = 20_000;
+
+/**
+ * Separate, much longer budget for reaching a connected state at all. TURN
+ * allocation on a slow mobile link is not quick, and the failure this guards
+ * against is a peer that hangs in 'connecting' forever rather than one that
+ * cannot decrypt.
+ */
+const CONNECT_TIMEOUT_MS = 90_000;
 
 /* RMS thresholds for the activity ring, tuned against typical mic levels. */
 const VAD_FLOOR = 0.018;
 const VAD_CEIL = 0.22;
 const VAD_TALKING = 0.14;
 
-const ICE_SERVERS = [
+/*
+ * ICE servers.
+ *
+ * STUN alone works when at least one side can be reached directly. It fails
+ * between two symmetric NATs, which is exactly the 4G/5G carrier-grade NAT case:
+ * a phone and a laptop on home wifi gather candidates that neither can use, ICE
+ * exhausts them, and the connection never comes up.
+ *
+ * The TURN entries below are the fallback for that. A TURN server forwards the
+ * traffic, so it works where nothing else does, at the cost of routing your
+ * media through a third party. Two things about that cost:
+ *
+ *   * It does not weaken encryption. A relay carries DTLS, and inside that,
+ *     AES-GCM frames it has no key for. It sees ciphertext and two addresses.
+ *   * It does see both addresses. That is a real disclosure, and it is why TURN
+ *     is a fallback: ICE prefers host and server-reflexive candidates, so a
+ *     relay is used only when nothing direct works. The transport panel says
+ *     `relayed` when it happens, so you are never guessing.
+ *
+ * These are the public OpenRelay credentials, shared by everyone who uses them
+ * and therefore rate-limited and not guaranteed to be up. For anything you
+ * depend on, run coturn or buy a TURN service and set window.ICE_SERVERS in
+ * index.html -- that override replaces this list wholesale.
+ */
+const DEFAULT_ICE_SERVERS = [
   { urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] },
+  // Port 80/443 and the TCP/TLS variants are what survive restrictive networks
+  // that allow only what looks like web traffic.
+  {
+    urls: [
+      'turn:openrelay.metered.ca:80',
+      'turn:openrelay.metered.ca:443',
+      'turn:openrelay.metered.ca:443?transport=tcp',
+      'turns:openrelay.metered.ca:443',
+    ],
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
 ];
+
+/** window.ICE_SERVERS, when set in index.html, replaces the defaults entirely. */
+const ICE_SERVERS = Array.isArray(window.ICE_SERVERS) && window.ICE_SERVERS.length
+  ? window.ICE_SERVERS
+  : DEFAULT_ICE_SERVERS;
 
 /* Used when the page is served from a static host, which cannot itself be the
    relay. Override per-deployment with window.SIGNALING_URL in index.html rather
@@ -281,6 +339,16 @@ const state = {
   signalingUrl: '',
   signalingSource: '',
   socket: null,
+  /**
+   * Stable across reconnects, random per page load, never persisted. The relay
+   * uses it to recognise a returning connection and evict the entry it left
+   * behind, which is what stops a phone changing network from showing up as a
+   * second occupant. It is not derived from anything identifying, and it dies
+   * with the tab.
+   */
+  sessionId: '',
+  reconnectAttempt: 0,
+  reconnectTimer: null,
   peers: new Map(),      // peerId -> Peer
   incoming: new Map(),   // transferId -> { from, meta, parts, received }
   blobUrls: new Set(),
@@ -411,7 +479,13 @@ function connectRelay(roomId, requestedCapacity) {
 
     // Capacity is a request, not an instruction: the relay honours it only when
     // this join creates the room, and clamps it to its own bounds either way.
-    sock.onopen = () => sendToRelay({ type: 'join', room: roomId, capacity: requestedCapacity });
+    // sessionId is how the relay recognises a reconnect and reclaims our slot.
+    sock.onopen = () => sendToRelay({
+      type: 'join',
+      room: roomId,
+      capacity: requestedCapacity,
+      sessionId: state.sessionId,
+    });
 
     sock.onmessage = (event) => {
       let message;
@@ -437,12 +511,116 @@ function connectRelay(roomId, requestedCapacity) {
 
     sock.onclose = () => {
       if (!settled) { settled = true; reject(new Error('relay_unreachable')); return; }
-      if (state.live) {
-        systemMessage('Lost the connection to the relay. Peers already connected stay connected; nobody new can join.', 'warn');
-        setStatus('degraded', 'Relay offline');
-      }
+      if (state.live && state.socket === sock) scheduleReconnect();
     };
   });
+}
+
+/* --- Reconnect ------------------------------------------------------------
+   A dropped signaling socket used to be terminal: the message said peers would
+   stay connected, which is only true until one of them moves. Now the mesh is
+   torn down and rebuilt, because a half-live mesh whose members cannot learn
+   about each other any more is worse than a clean restart.
+   -------------------------------------------------------------------------- */
+
+const RECONNECT_BASE_MS = 1_000;
+const RECONNECT_MAX_MS = 15_000;
+const RECONNECT_MAX_ATTEMPTS = 8;
+
+/**
+ * Drop every peer connection and all per-connection state, keeping the room key
+ * and identity. Called before re-joining so nothing from the previous session
+ * survives into the new one.
+ */
+function resetMesh() {
+  for (const peer of state.peers.values()) peer.close();
+  state.peers.clear();
+
+  for (const peerId of [...audio.sinks.keys()]) detachRemoteAudio(peerId);
+  // Partial transfers cannot be resumed across a reconnect; half a file is not
+  // worth the memory it is sitting in.
+  state.incoming.clear();
+
+  state.hostId = '';
+  capacityIntent = null;
+  renderPeers();
+  renderTransport();
+}
+
+function scheduleReconnect() {
+  if (!state.live || state.reconnectTimer !== null) return;
+
+  resetMesh();
+
+  if (state.reconnectAttempt >= RECONNECT_MAX_ATTEMPTS) {
+    setStatus('degraded', 'Disconnected');
+    systemMessage(
+      `Gave up reconnecting to the relay after ${RECONNECT_MAX_ATTEMPTS} attempts. Reload to try again.`,
+      'warn',
+    );
+    return;
+  }
+
+  const attempt = state.reconnectAttempt;
+  state.reconnectAttempt += 1;
+  // Exponential with jitter, so a relay restart does not get every client back
+  // at the same instant.
+  const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** attempt)
+    * (0.75 + Math.random() * 0.5);
+
+  setStatus('degraded', `Reconnecting in ${Math.round(delay / 1000)}s`);
+  if (attempt === 0) {
+    systemMessage('Lost the connection to the relay. Rebuilding the room…', 'warn');
+  }
+
+  state.reconnectTimer = setTimeout(() => {
+    state.reconnectTimer = null;
+    rejoin().catch(() => scheduleReconnect());
+  }, delay);
+}
+
+async function rejoin() {
+  if (!state.live) return;
+  setStatus('connecting', 'Reconnecting');
+
+  let welcome;
+  try {
+    welcome = await connectRelay(state.roomId, state.capacity);
+  } catch (err) {
+    if (err.message === 'room_full') {
+      // Someone took the slot while we were away. Retrying would just fail
+      // again, so stop and say so.
+      state.reconnectAttempt = RECONNECT_MAX_ATTEMPTS;
+      setStatus('degraded', 'Room full');
+      systemMessage('The room filled up while you were disconnected. Reload to try rejoining.', 'warn');
+      return;
+    }
+    throw err;
+  }
+
+  // Back in. The relay has already evicted our previous entry, so the roster it
+  // hands back does not contain us twice.
+  state.reconnectAttempt = 0;
+  applyWelcome(welcome);
+  systemMessage(
+    welcome.peers.length
+      ? `Reconnected. Re-establishing ${welcome.peers.length} ${welcome.peers.length === 1 ? 'connection' : 'connections'}.`
+      : 'Reconnected. Waiting for others.',
+  );
+  for (const peerId of welcome.peers) addPeer(peerId);
+}
+
+/** Adopt the relay's view of the room. Shared by the first join and every rejoin. */
+function applyWelcome(welcome) {
+  state.peerId = welcome.peerId;
+  state.hostId = welcome.hostId || '';
+  if (typeof welcome.capacity === 'number') state.capacity = welcome.capacity;
+  if (typeof welcome.ceiling === 'number') state.ceiling = welcome.ceiling;
+  if (typeof welcome.minCapacity === 'number') state.minCapacity = welcome.minCapacity;
+  capacityIntent = null;
+  renderPeers();
+  renderCapacityControl();
+  renderTransport();
 }
 
 function handleRelayMessage(message) {
@@ -560,9 +738,14 @@ class Peer {
       this.pc.ondatachannel = (event) => this.bindChannel(event.channel);
     }
 
-    this.verifyTimer = setTimeout(() => {
-      if (!this.verified) this.reject('timeout');
-    }, VERIFY_TIMEOUT_MS);
+    // Two separate clocks. This one only asks "did we ever connect", and is
+    // generous enough for a TURN allocation on a slow mobile link. The key-proof
+    // clock does not start until a channel is actually open.
+    this.verifyTimer = null;
+    this.connectTimer = setTimeout(() => {
+      const s = this.pc.connectionState;
+      if (s !== 'connected' && s !== 'closed') this.reject('unreachable');
+    }, CONNECT_TIMEOUT_MS);
   }
 
   signal(data) {
@@ -633,6 +816,14 @@ class Peer {
     channel.bufferedAmountLowThreshold = DC_LOW_WATER;
 
     channel.onopen = () => {
+      // Now, and only now, does the key-proof deadline start.
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+      if (!this.verified && this.verifyTimer === null) {
+        this.verifyTimer = setTimeout(() => {
+          if (!this.verified) this.reject('timeout');
+        }, VERIFY_TIMEOUT_MS);
+      }
       this.send(F.HELLO, {
         nick: state.nick,
         muted: audio.muted,
@@ -688,22 +879,24 @@ class Peer {
     }
   }
 
-  /** Refuse this peer: it cannot prove it holds the room key. */
+  /** Refuse this peer, saying which of the two failures it was. */
   reject(reason) {
     if (this.dead) return;
     const label = this.nick || `peer ${this.id.slice(0, 6)}`;
-    systemMessage(
-      reason === 'passkey'
-        ? `Dropped ${label}: their passkey doesn't match this room.`
-        : `Dropped ${label}: they never proved they hold the room key.`,
-      'warn',
-    );
+    const reasons = {
+      passkey: `Dropped ${label}: their passkey doesn't match this room.`,
+      timeout: `Dropped ${label}: they never proved they hold the room key.`,
+      unreachable: `Couldn't reach ${label}. Both sides may be behind networks that `
+        + 'block direct connections, and the fallback relay did not answer either.',
+    };
+    systemMessage(reasons[reason] || reasons.timeout, 'warn');
     removePeer(this.id, reason);
   }
 
   close() {
     this.dead = true;
     clearTimeout(this.verifyTimer);
+    clearTimeout(this.connectTimer);
     if (this.channel) {
       this.channel.onmessage = null;
       this.channel.onclose = null;
@@ -1570,6 +1763,10 @@ async function join(roomName, passkey, nick, wantMic, requestedCapacity) {
   state.roomKey = session.roomKey;
   state.roomId = session.roomId;
   state.seal = session.seal;
+  // One identity for the life of this tab, so a reconnect is recognisable as
+  // the same person rather than a new arrival.
+  state.sessionId = randomHex(16);
+  state.reconnectAttempt = 0;
 
   let micReady = false;
   if (wantMic) {
@@ -1600,16 +1797,10 @@ async function join(roomName, passkey, nick, wantMic, requestedCapacity) {
   $('room-label').textContent = roomName;
 
   // The relay is authoritative for all of this; adopt its answer, not our ask.
-  state.hostId = welcome.hostId || '';
-  if (typeof welcome.capacity === 'number') state.capacity = welcome.capacity;
-  if (typeof welcome.ceiling === 'number') state.ceiling = welcome.ceiling;
-  if (typeof welcome.minCapacity === 'number') state.minCapacity = welcome.minCapacity;
+  applyWelcome(welcome);
 
   renderSeal();
   renderSelf();
-  renderPeers();
-  renderCapacityControl();
-  renderTransport();
   setStatus(welcome.peers.length ? 'live' : 'connecting',
     welcome.peers.length ? 'In room' : 'Waiting for others');
 
@@ -1665,6 +1856,7 @@ function destroySession() {
     state.socket = null;
   }
 
+  if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
   if (state.statsTimer) { clearInterval(state.statsTimer); state.statsTimer = null; }
   if (state.levelFrame) { cancelAnimationFrame(state.levelFrame); state.levelFrame = null; }
 
@@ -1676,6 +1868,8 @@ function destroySession() {
   state.seal = null;
   state.roomId = '';
   state.hostId = '';
+  state.sessionId = '';
+  state.reconnectAttempt = 0;
   capacityIntent = null;
 }
 

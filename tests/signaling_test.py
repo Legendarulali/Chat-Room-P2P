@@ -66,6 +66,11 @@ async def join_with(ws, rid: str, capacity) -> dict:
     return await recv_json(ws)
 
 
+async def join_with_session(ws, rid: str, session_id) -> dict:
+    await ws.send(json.dumps({"type": "join", "room": rid, "sessionId": session_id}))
+    return await recv_json(ws)
+
+
 def debug_stats() -> dict | None:
     try:
         with urllib.request.urlopen(f"{BASE_HTTP}/api/debug/stats", timeout=3) as response:
@@ -366,6 +371,110 @@ async def test_host_reassignment() -> None:
         await recv_json(third)
 
 
+async def test_reconnect_replaces_ghost() -> None:
+    print("\n[ a reconnect replaces its own entry instead of inflating the room ]")
+    rid = room_id("ghost-test")
+    session = "a" * 32
+
+    async with websockets.connect(BASE_WS) as watcher:
+        await join_with(watcher, rid, 6)
+
+        first = await websockets.connect(BASE_WS)
+        await first.send(json.dumps({"type": "join", "room": rid, "sessionId": session}))
+        welcome_first = await recv_json(first)
+        await recv_json(watcher)  # peer-join
+
+        # Reconnect with the same session id while the old socket is still open,
+        # which is exactly what a mobile network change looks like to the relay.
+        second = await websockets.connect(BASE_WS)
+        await second.send(json.dumps({"type": "join", "room": rid, "sessionId": session}))
+        welcome_second = await recv_json(second)
+
+        check("reconnect is admitted", welcome_second.get("type") == "welcome", str(welcome_second))
+        check("reconnect gets a fresh peer id",
+              welcome_second.get("peerId") != welcome_first.get("peerId"))
+        check("reconnect does not see its own ghost",
+              welcome_first["peerId"] not in welcome_second.get("peers", []),
+              str(welcome_second.get("peers")))
+        check("room did not inflate: reconnect sees only the watcher",
+              len(welcome_second.get("peers", [])) == 1, str(welcome_second.get("peers")))
+
+        # The watcher must be told the old peer left, then that the new one arrived.
+        left = await recv_json(watcher)
+        check("watcher is told the ghost left",
+              left.get("type") == "peer-leave" and left.get("peerId") == welcome_first["peerId"],
+              str(left))
+        joined = await recv_json(watcher)
+        check("watcher is told the reconnect arrived",
+              joined.get("type") == "peer-join" and joined.get("peerId") == welcome_second["peerId"],
+              str(joined))
+
+        stats = debug_stats()
+        if stats is not None:
+            check("only two peers are counted", stats["peers"] == 2, str(stats))
+
+        await first.close()
+        await second.close()
+
+    print("\n[ distinct sessions are independent ]")
+    rid2 = room_id("distinct-sessions")
+    a = await websockets.connect(BASE_WS)
+    b = await websockets.connect(BASE_WS)
+    try:
+        await a.send(json.dumps({"type": "join", "room": rid2, "sessionId": "b" * 32}))
+        welcome_a = await recv_json(a)
+        await b.send(json.dumps({"type": "join", "room": rid2, "sessionId": "c" * 32}))
+        welcome_b = await recv_json(b)
+        check("a different session is a different peer",
+              welcome_b.get("peers") == [welcome_a["peerId"]], str(welcome_b))
+    finally:
+        await a.close()
+        await b.close()
+
+    print("\n[ a malformed session id is ignored, not stored ]")
+    for label, bad in (("too short", "abc"), ("uppercase", "A" * 32), ("wrong type", 42)):
+        async with websockets.connect(BASE_WS) as ws:
+            welcome = await join_with_session(ws, room_id(f"badsession-{label}"), bad)
+            check(f"still admitted with a {label} session id",
+                  welcome.get("type") == "welcome", str(welcome))
+
+
+async def test_reconnecting_host_keeps_crown() -> None:
+    print("\n[ a host that reconnects keeps the crown ]")
+    rid = room_id("host-reconnect")
+    session = "d" * 32
+
+    host = await websockets.connect(BASE_WS)
+    guest = await websockets.connect(BASE_WS)
+    try:
+        await host.send(json.dumps({"type": "join", "room": rid, "sessionId": session, "capacity": 4}))
+        welcome_host = await recv_json(host)
+        await join(guest, rid)
+        await recv_json(host)  # peer-join
+
+        check("host holds the crown", welcome_host.get("hostId") == welcome_host.get("peerId"))
+
+        again = await websockets.connect(BASE_WS)
+        try:
+            await again.send(json.dumps({"type": "join", "room": rid, "sessionId": session}))
+            welcome_again = await recv_json(again)
+            check("reconnecting host is still the host",
+                  welcome_again.get("hostId") == welcome_again.get("peerId"), str(welcome_again))
+            check("the crown did not pass to the guest",
+                  welcome_again.get("hostId") != welcome_host.get("peerId"), str(welcome_again))
+            check("capacity survives the reconnect", welcome_again.get("capacity") == 4, str(welcome_again))
+
+            # And the reconnected host can still use the control.
+            await again.send(json.dumps({"type": "set-capacity", "capacity": 5}))
+            applied = await recv_json(again)
+            check("reconnected host can still resize", applied.get("capacity") == 5, str(applied))
+        finally:
+            await again.close()
+    finally:
+        await host.close()
+        await guest.close()
+
+
 async def test_peer_cap() -> None:
     print("\n[ eight peers in, ninth refused ]")
     rid = room_id("cap-test")
@@ -522,6 +631,8 @@ async def main() -> int:
         test_capacity_enforced,
         test_host_can_resize,
         test_host_reassignment,
+        test_reconnect_replaces_ghost,
+        test_reconnecting_host_keeps_crown,
         test_peer_cap,
         test_room_is_deleted_when_empty,
         test_peer_leave_notice,
