@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 
+# Local scratch notes that must never be published.
+DO NOT ADD ON GITHUB*
+
 # There should never be anything to ignore here, because this project does not
 # write files. If a log or database ever shows up, that is a bug, not something
 # to sweep under an ignore rule.
