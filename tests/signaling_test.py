@@ -391,29 +391,48 @@ async def test_reconnect_replaces_ghost() -> None:
         welcome_second = await recv_json(second)
 
         check("reconnect is admitted", welcome_second.get("type") == "welcome", str(welcome_second))
-        check("reconnect gets a fresh peer id",
-              welcome_second.get("peerId") != welcome_first.get("peerId"))
+        # The reused id is what lets the other peers keep their connections and
+        # merely restart ICE, instead of tearing down and rebuilding the mesh.
+        check("reconnect reclaims the same peer id",
+              welcome_second.get("peerId") == welcome_first.get("peerId"),
+              f"{welcome_first.get('peerId')} -> {welcome_second.get('peerId')}")
         check("reconnect does not see its own ghost",
               welcome_first["peerId"] not in welcome_second.get("peers", []),
               str(welcome_second.get("peers")))
         check("room did not inflate: reconnect sees only the watcher",
               len(welcome_second.get("peers", [])) == 1, str(welcome_second.get("peers")))
 
-        # The watcher must be told the old peer left, then that the new one arrived.
-        left = await recv_json(watcher)
-        check("watcher is told the ghost left",
-              left.get("type") == "peer-leave" and left.get("peerId") == welcome_first["peerId"],
-              str(left))
-        joined = await recv_json(watcher)
-        check("watcher is told the reconnect arrived",
-              joined.get("type") == "peer-join" and joined.get("peerId") == welcome_second["peerId"],
-              str(joined))
+        # One notice, and it is neither a departure nor an arrival.
+        notice = await recv_json(watcher)
+        check("watcher is told the peer resumed",
+              notice.get("type") == "peer-resumed"
+              and notice.get("peerId") == welcome_first["peerId"],
+              str(notice))
 
         stats = debug_stats()
         if stats is not None:
             check("only two peers are counted", stats["peers"] == 2, str(stats))
 
+        # The displaced socket runs its own teardown a moment later. Because the
+        # peer id now belongs to the new socket, that teardown must not evict it
+        # or announce a departure -- this is the hazard peer id reuse introduces.
         await first.close()
+        await asyncio.sleep(0.3)
+
+        stats = debug_stats()
+        if stats is not None:
+            check("the stale socket's teardown did not evict the reconnect",
+                  stats["peers"] == 2, str(stats))
+
+        await second.send(json.dumps({"type": "ping"}))
+        pong = await recv_json(second)
+        check("the reconnected socket is still in the room", pong.get("type") == "pong", str(pong))
+
+        # And the watcher heard nothing about a departure.
+        await watcher.send(json.dumps({"type": "ping"}))
+        echo = await recv_json(watcher)
+        check("watcher was not told anyone left", echo.get("type") == "pong", str(echo))
+
         await second.close()
 
     print("\n[ distinct sessions are independent ]")
@@ -460,8 +479,10 @@ async def test_reconnecting_host_keeps_crown() -> None:
             welcome_again = await recv_json(again)
             check("reconnecting host is still the host",
                   welcome_again.get("hostId") == welcome_again.get("peerId"), str(welcome_again))
-            check("the crown did not pass to the guest",
-                  welcome_again.get("hostId") != welcome_host.get("peerId"), str(welcome_again))
+            # The crown never moved because it points at a peer id that did not
+            # change. Nothing had to be reassigned for a network blip.
+            check("the crown still names the same peer id",
+                  welcome_again.get("hostId") == welcome_host.get("peerId"), str(welcome_again))
             check("capacity survives the reconnect", welcome_again.get("capacity") == 4, str(welcome_again))
 
             # And the reconnected host can still use the control.
@@ -473,6 +494,107 @@ async def test_reconnecting_host_keeps_crown() -> None:
     finally:
         await host.close()
         await guest.close()
+
+
+async def test_welcome_carries_an_ordered_roster() -> None:
+    print("\n[ welcome states the room's order, including the recipient ]")
+    rid = room_id("roster-order")
+    sockets = []
+    try:
+        session = "f" * 32
+        welcomes = []
+        for index in range(3):
+            ws = await websockets.connect(BASE_WS)
+            sockets.append(ws)
+            if index == 1:
+                # Give the middle one a session, so its resume can be checked to
+                # hold its position rather than moving to the end.
+                await ws.send(json.dumps({"type": "join", "room": rid, "sessionId": session}))
+                welcomes.append(await recv_json(ws))
+            else:
+                welcomes.append(await join(ws, rid))
+
+        ids = [w["peerId"] for w in welcomes]
+        check("each joiner is told the full room order",
+              [w.get("roster") for w in welcomes] == [ids[:1], ids[:2], ids[:3]],
+              str([w.get("roster") for w in welcomes]))
+        # The clients need their own position, which `peers` alone cannot give.
+        check("the roster includes the recipient",
+              all(w["peerId"] in w.get("roster", []) for w in welcomes),
+              str([w.get("roster") for w in welcomes]))
+        check("peers is still the roster minus the recipient",
+              all(w.get("peers") == [p for p in w.get("roster", []) if p != w["peerId"]]
+                  for w in welcomes),
+              str([(w.get("peers"), w.get("roster")) for w in welcomes]))
+
+        # A resume must hold its position rather than moving to the end, or the
+        # order everyone agreed on would shuffle over a network blip.
+        again = await websockets.connect(BASE_WS)
+        sockets.append(again)
+        await again.send(json.dumps({"type": "join", "room": rid, "sessionId": session}))
+        resumed = await recv_json(again)
+        check("a resume keeps its place in the roster",
+              resumed.get("roster") == ids, f"{resumed.get('roster')} vs {ids}")
+        check("and its position is still the middle one",
+              resumed.get("roster", []).index(resumed["peerId"]) == 1, str(resumed.get("roster")))
+
+        # A genuinely new session goes to the end.
+        newcomer = await websockets.connect(BASE_WS)
+        sockets.append(newcomer)
+        fresh = await join(newcomer, rid)
+        check("a new arrival goes to the end of the roster",
+              fresh.get("roster") == ids + [fresh["peerId"]], str(fresh.get("roster")))
+    finally:
+        for ws in sockets:
+            await ws.close()
+
+
+async def test_resume_is_admitted_into_a_full_room() -> None:
+    print("\n[ a reconnect into a full room is admitted; a newcomer is not ]")
+    rid = room_id("full-room-resume")
+    session = "e" * 32
+
+    sockets = []
+    try:
+        # Fill a room of two: one session-tracked peer plus one plain peer.
+        first = await websockets.connect(BASE_WS)
+        sockets.append(first)
+        await first.send(json.dumps(
+            {"type": "join", "room": rid, "sessionId": session, "capacity": 2}))
+        welcome_first = await recv_json(first)
+        check("room opened at capacity 2", welcome_first.get("capacity") == 2, str(welcome_first))
+
+        other = await websockets.connect(BASE_WS)
+        sockets.append(other)
+        welcome_other = await join(other, rid)
+        check("second peer fills the room", welcome_other.get("type") == "welcome", str(welcome_other))
+        await recv_json(first)  # peer-join
+
+        # A stranger is refused, which is the baseline the next check needs.
+        async with websockets.connect(BASE_WS) as stranger:
+            refusal = await join(stranger, rid)
+            check("a newcomer is refused", refusal.get("code") == "room_full", str(refusal))
+
+        # The same session is not a newcomer: it already occupies one of the two
+        # slots, so requiring a free slot to come back would lock someone out of
+        # their own full room every time their network hiccupped.
+        again = await websockets.connect(BASE_WS)
+        sockets.append(again)
+        await again.send(json.dumps({"type": "join", "room": rid, "sessionId": session}))
+        welcome_again = await recv_json(again)
+        check("a reconnect is admitted into a full room",
+              welcome_again.get("type") == "welcome", str(welcome_again))
+        check("and it holds the same peer id",
+              welcome_again.get("peerId") == welcome_first.get("peerId"), str(welcome_again))
+        check("and the room is still just the two of them",
+              welcome_again.get("peers") == [welcome_other["peerId"]], str(welcome_again))
+
+        stats = debug_stats()
+        if stats is not None:
+            check("no third occupant was created", stats["peers"] == 2, str(stats))
+    finally:
+        for ws in sockets:
+            await ws.close()
 
 
 async def test_peer_cap() -> None:
@@ -633,6 +755,8 @@ async def main() -> int:
         test_host_reassignment,
         test_reconnect_replaces_ghost,
         test_reconnecting_host_keeps_crown,
+        test_welcome_carries_an_ordered_roster,
+        test_resume_is_admitted_into_a_full_room,
         test_peer_cap,
         test_room_is_deleted_when_empty,
         test_peer_leave_notice,

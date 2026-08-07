@@ -250,12 +250,26 @@ return true;
 
 
 async def join(
-    page: Page, nick: str, passkey: str = PASSKEY, mic: bool = True, capacity: int = 8
+    page: Page, nick: str, passkey: str = PASSKEY, mic: bool = True,
+    capacity: int = 8, room: str = ROOM,
 ) -> None:
     await page.eval(JOIN_JS.format(
-        room=ROOM, passkey=passkey, nick=nick, capacity=capacity,
+        room=room, passkey=passkey, nick=nick, capacity=capacity,
         mic="true" if mic else "false",
     ))
+
+
+async def roster(page: Page) -> list[str]:
+    """Just the display names in the sidebar, in order.
+
+    peerRow puts the name in its own span.truncate, separate from the crown glyph
+    and the "you" tag, so this reads the name and nothing else.
+    """
+    names = await page.eval("""
+        return JSON.stringify([...document.querySelectorAll('#peer-list li')]
+            .map(li => li.querySelector('p span.truncate')?.textContent.trim() ?? null));
+    """)
+    return json.loads(names)
 
 
 async def in_room(page: Page) -> bool:
@@ -823,18 +837,252 @@ async def run_static_host_check(binary: str) -> None:
         await browser.stop()
 
 
+async def run_identity_checks(browser: Browser) -> None:
+    """Three people, all claiming the same name, in their own room.
+
+    The property that matters is agreement: it is no use if each client picks its
+    own answer, because then one person's "dan (2)" is another's "dan" and the
+    confusion is worse than the duplicate was. Nothing coordinates this -- the
+    relay never sees a display name -- so each client has to derive the same
+    answer from what it independently knows.
+    """
+    probe = await browser.open_page("probe", f"{BASE_HTTP}/")
+    await probe.wait_for("document.getElementById('brand-seal')?.children.length === 16", seconds=25)
+
+    # A stray --> once closed the config comment early, and the paragraph after it
+    # rendered as body text at the top of the page. Nothing in the markup is
+    # supposed to reach the screen except through an element the app controls, so
+    # assert that directly rather than trusting the delimiters to stay matched.
+    print("\n[ no documentation leaks into the page ]")
+    leaked = await probe.eval("""
+        const text = document.body.innerText;
+        const terms = ['ICE_SERVERS', 'SIGNALING_URL', 'FALLBACK_', 'coturn',
+                       'OpenRelay', 'connect-src', 'wss://', '-->'];
+        return JSON.stringify(terms.filter(t => text.includes(t)));
+    """)
+    check("no config prose is rendered", json.loads(leaked) == [], str(leaked))
+
+    stray = await probe.eval("""
+        // Any text node directly under <body> or <head> that is not whitespace.
+        const loose = [];
+        for (const root of [document.head, document.body]) {
+            for (const node of root.childNodes) {
+                if (node.nodeType === 3 && node.textContent.trim()) {
+                    loose.push(node.textContent.trim().slice(0, 60));
+                }
+            }
+        }
+        return JSON.stringify(loose);
+    """)
+    check("no loose text nodes outside an element", json.loads(stray) == [], str(stray))
+
+    print("\n[ display names: the pure function ]")
+
+    # cleanNick is what stops a name from being made to *look* like another one.
+    cleaned = await probe.eval(r"""
+        return JSON.stringify({
+            zeroWidth: cleanNick('dan\u200b'),
+            rtlOverride: cleanNick('dan\u202e'),
+            bom: cleanNick('\ufeffdan'),
+            controls: cleanNick('da\u0007n'),
+            spaces: cleanNick('  dan   smith  '),
+            newline: cleanNick('dan\nsmith'),
+            empty: cleanNick('\u200b\u200b'),
+            blank: cleanNick('   '),
+            missing: cleanNick(null),
+            tooLong: cleanNick('x'.repeat(80)).length,
+            foldsCase: foldNick('DAN') === foldNick('dan'),
+            foldsInvisible: foldNick('dan\u200b') === foldNick('dan'),
+        });
+    """)
+    got = json.loads(cleaned)
+    check("a zero-width space is stripped", got["zeroWidth"] == "dan", str(got["zeroWidth"]))
+    check("a bidi override is stripped", got["rtlOverride"] == "dan", str(got["rtlOverride"]))
+    check("a byte order mark is stripped", got["bom"] == "dan", str(got["bom"]))
+    check("control characters are stripped", got["controls"] == "dan", str(got["controls"]))
+    check("runs of whitespace collapse", got["spaces"] == "dan smith", str(got["spaces"]))
+    check("a newline cannot split a name", got["newline"] == "dan smith", str(got["newline"]))
+    check("an all-invisible name falls back", got["empty"] == "peer", str(got["empty"]))
+    check("a blank name falls back", got["blank"] == "peer", str(got["blank"]))
+    check("a missing name falls back", got["missing"] == "peer", str(got["missing"]))
+    check("a long name is truncated", got["tooLong"] == 24, str(got["tooLong"]))
+    check("case does not make a new person", got["foldsCase"] is True)
+    check("an invisible does not make a new person", got["foldsInvisible"] is True)
+
+    # resolveLabels reads the live room, so drive it against a fabricated one. The
+    # interesting inputs are the ones that would be tedious to arrange with real
+    # peers -- above all somebody claiming the literal string another peer has
+    # already been *given*.
+    print("\n[ display names: collisions resolve to distinct labels ]")
+    resolved = await probe.eval("""
+        const label = (nicks) => {
+            // A throwaway room: resolveLabels only needs order, id, and nick.
+            state.peerId = 'self';
+            state.nick = cleanNick(nicks[0]);
+            state.selfOrder = 0;
+            state.peers = new Map(nicks.slice(1).map((nick, i) => [
+                'p' + i,
+                { id: 'p' + i, order: i + 1, nick: cleanNick(nick), label: null },
+            ]));
+            resolveLabels();
+            return [state.label, ...[...state.peers.values()].map(p => p.label)];
+        };
+        const out = {
+            plain: label(['ana', 'ben']),
+            twoSame: label(['dan', 'dan']),
+            threeSame: label(['dan', 'dan', 'dan']),
+            caseOnly: label(['Dan', 'dan']),
+            invisible: label(['dan', 'dan\\u200b']),
+            claimsTheSuffix: label(['dan', 'dan', 'dan (2)']),
+            suffixFirst: label(['dan (2)', 'dan', 'dan']),
+        };
+        state.peers = new Map();
+        return JSON.stringify(out);
+    """)
+    got = json.loads(resolved)
+    check("distinct names are left alone", got["plain"] == ["ana", "ben"], str(got["plain"]))
+    check("two of the same name get a counter",
+          got["twoSame"] == ["dan", "dan (2)"], str(got["twoSame"]))
+    check("three of the same name keep counting",
+          got["threeSame"] == ["dan", "dan (2)", "dan (3)"], str(got["threeSame"]))
+    check("a case-only difference still counts as a collision",
+          got["caseOnly"] == ["Dan", "dan (2)"], str(got["caseOnly"]))
+    check("an invisible character does not dodge the collision",
+          got["invisible"] == ["dan", "dan (2)"], str(got["invisible"]))
+    # The bypass: claiming the label the second "dan" was handed.
+    check("claiming another peer's assigned label does not duplicate it",
+          got["claimsTheSuffix"] == ["dan", "dan (2)", "dan (2) (2)"],
+          str(got["claimsTheSuffix"]))
+    check("a name that already looks like a counter is not special",
+          len(set(got["suffixFirst"])) == 3, str(got["suffixFirst"]))
+    for key, labels in got.items():
+        check(f"every label in the {key} case is unique",
+              len({name.lower() for name in labels}) == len(labels), str(labels))
+
+    print("\n[ three peers all called dan ]")
+    room = "identity-room"
+    first = await browser.open_page("dan-1", f"{BASE_HTTP}/")
+    second = await browser.open_page("dan-2", f"{BASE_HTTP}/")
+    third = await browser.open_page("dan-3", f"{BASE_HTTP}/")
+    for page in (first, second, third):
+        await page.wait_for("document.getElementById('brand-seal')?.children.length === 16", seconds=25)
+
+    # Sequential, so arrival order is unambiguous. The third uses a zero-width
+    # space, which is the impersonation attempt: without cleanNick it would render
+    # as a third bare "dan" rather than colliding.
+    await join(first, "dan", room=room, mic=False)
+    check("the first dan joined", await in_room(first))
+    await join(second, "dan", room=room, mic=False)
+    check("the second dan joined", await in_room(second))
+    await join(third, "dan\u200b", room=room, mic=False)
+    check("the third dan joined", await in_room(third))
+
+    settled = await first.wait_for(
+        "document.getElementById('peer-count').textContent === '3/8'", seconds=90)
+    check("all three are in the room", bool(settled),
+          await first.eval("return document.getElementById('peer-count').textContent;"))
+
+    for page in (first, second, third):
+        await page.wait_for("""
+            return [...document.querySelectorAll('#peer-list li')]
+                .every(li => li.querySelector('p span.truncate')
+                    ?.textContent.trim().startsWith('dan')) ? 'yes' : false;
+        """, seconds=90)
+
+    views = {page.name: sorted(await roster(page)) for page in (first, second, third)}
+    expected = sorted(["dan", "dan (2)", "dan (3)"])
+    for name, view in views.items():
+        check(f"{name} sees three distinguishable names", view == expected, str(view))
+    check("every client agrees on the same three names",
+          len({tuple(v) for v in views.values()}) == 1, str(views))
+
+    # Agreement has to go further than the set of names: each client must attach
+    # the same name to the same person.
+    labels = {}
+    for page in (first, second, third):
+        labels[page.name] = json.loads(await page.eval("""
+            const out = { self: [state.peerId, state.label] };
+            for (const p of state.peers.values()) out[p.id] = p.label;
+            return JSON.stringify(out);
+        """))
+    mapping = {}
+    agree = True
+    for view in labels.values():
+        own_id, own_label = view.pop("self")
+        for peer_id, label in list(view.items()) + [(own_id, own_label)]:
+            if mapping.setdefault(peer_id, label) != label:
+                agree = False
+    check("no peer id is labelled two different ways", agree, str(labels))
+    check("three distinct people, three distinct labels",
+          len(set(mapping.values())) == 3, str(mapping))
+
+    # The incumbent keeps the bare name: arrival order decides, so nobody already
+    # in the room is renamed by a newcomer.
+    own = {}
+    for page in (first, second, third):
+        own[page.name] = await page.eval("return state.label;")
+    check("the first to arrive keeps the plain name", own["dan-1"] == "dan", str(own))
+    check("the second gets a counter", own["dan-2"] == "dan (2)", str(own))
+    check("the third gets the next counter", own["dan-3"] == "dan (3)", str(own))
+
+    # And a message is attributed to the label, not the claim.
+    await send_chat(third, "which dan is this")
+    attributed = await first.wait_for("""
+        const rows = [...document.querySelectorAll('#log .msg-enter')];
+        const row = rows.find(r => r.textContent.includes('which dan is this'));
+        if (!row) return false;
+        return row.querySelector('[data-field="name"]')?.textContent || false;
+    """, seconds=60)
+    check("a message from the third dan is labelled dan (3)", attributed == "dan (3)", str(attributed))
+
+    # A rename onto a name already present must be announced, not absorbed: a
+    # silent one is exactly how impersonation would work.
+    await third.eval("""
+        const peers = [...state.peers.values()];
+        for (const p of peers) p.send(F.HELLO, { nick: 'renamed-dan', muted: false, deafened: false });
+        return true;
+    """)
+    announced = await first.wait_for("""
+        return [...document.querySelectorAll('#log .msg-body')]
+            .some(n => /is now calling themselves/i.test(n.textContent)) ? 'yes' : false;
+    """, seconds=60)
+    check("a mid-session rename is announced", announced == "yes",
+          str(await log_text(first)))
+    relabelled = await first.wait_for("""
+        const rows = [...document.querySelectorAll('#log .msg-enter')];
+        const row = rows.find(r => r.textContent.includes('which dan is this'));
+        return row?.querySelector('[data-field="name"]')?.textContent === 'renamed-dan'
+            ? 'yes' : false;
+    """, seconds=30)
+    check("their earlier message is relabelled to match", relabelled == "yes",
+          await first.eval("""
+            const rows = [...document.querySelectorAll('#log .msg-enter')];
+            const row = rows.find(r => r.textContent.includes('which dan is this'));
+            return row?.querySelector('[data-field="name"]')?.textContent || 'gone';
+          """))
+
+    for page in (probe, first, second, third):
+        errors = await page.eval("return window.__errors || [];")
+        check(f"{page.name}: no uncaught errors", not errors, "; ".join(errors or []))
+
+
 async def run_reconnect_check(binary: str) -> None:
     """Kill the relay under two live clients and watch them come back.
 
-    This uses a relay of its own so it can be restarted, which is the only
-    reliable way to sever an established websocket here: CDP's offline emulation
-    leaves loopback connections alone, so it drops nothing.
+    Two phases, because the two outages are not the same failure:
 
-    It is the production case that matters -- a free tier waking up, a redeploy,
-    a dropped mobile link -- and the thing being checked is that each client
-    rebuilds rather than accumulating a second copy of everyone.
+      1. The socket drops while the relay stays up. The relay still holds the
+         room, so it recognises the session and hands the same peer id back --
+         the peers keep their connections and only ICE is restarted.
+      2. The relay process restarts. Its rooms were in memory, so they are gone;
+         there is nothing to resume and the mesh has to be rebuilt. What matters
+         here is that it rebuilds *once* per peer instead of accumulating ghosts.
+
+    A relay of its own, because restarting the shared one would break every other
+    check. CDP's offline emulation is not an alternative: it leaves loopback
+    connections alone, so it drops nothing at all.
     """
-    print("\n[ the relay restarts under two live clients ]")
+    print("\n[ two clients on a private relay ]")
 
     import socket as _socket
 
@@ -891,55 +1139,269 @@ async def run_reconnect_check(binary: str) -> None:
             "document.getElementById('transport').textContent.includes('1/1 connected')", seconds=60)
         check("mesh formed before the restart", bool(formed))
 
-        # Down it goes.
+        # -- Phase one: the signaling path moves, the relay stays up -----------
+        #
+        # A network change leaves the relay holding a socket it does not yet know
+        # is dead: the phone's route is gone, so no close frame ever arrives and
+        # the peer stays in the room until the relay's own ping times out. The new
+        # socket therefore turns up *while the old one is still registered*, which
+        # is the only ordering under which a resume is possible.
+        #
+        # That ordering is what is reproduced here. It is not simulated by closing
+        # the socket: a close frame reaches the relay immediately, the peer is torn
+        # down before the reconnect lands, and a rebuild is then the correct
+        # outcome -- which is what phase two covers. So this drives rejoin()
+        # directly, with the relay in exactly the state a network change leaves it.
+        print("\n[ a moved signaling path resumes rather than rebuilding ]")
+
+        before = await one.eval("""
+            const peer = [...state.peers.values()][0];
+            // Tag the live objects. If either is replaced, this peer was rebuilt,
+            // which is exactly what must not happen.
+            peer.__probe = 'kept';
+            peer.channel.__probe = 'kept';
+            return JSON.stringify({ peerId: state.peerId, otherId: peer.id, verified: peer.verified });
+        """)
+        marks = json.loads(before)
+        check("ivy is verified before the drop", marks["verified"] is True, str(marks))
+
+        resumed = await one.eval("""
+            state.reconnecting = true;
+            await rejoin();
+            return [...document.querySelectorAll('#log .msg-body')]
+                .some(n => /reconnected/i.test(n.textContent)) ? 'yes' : false;
+        """, timeout=90)
+        check("ivy rejoins and is told so", resumed == "yes",
+              await one.eval("return document.getElementById('status-text').textContent;"))
+        kept_note = await one.eval("""
+            const body = [...document.querySelectorAll('#log .msg-body')]
+                .reverse().find(n => /reconnected/i.test(n.textContent));
+            return body ? body.textContent : null;
+        """)
+        check("the notice says the connection was kept, not rebuilt",
+              "kept" in (kept_note or "") and "rebuilding" not in (kept_note or ""),
+              str(kept_note))
+
+        after = await one.eval("""
+            const peer = state.peers.get(%s);
+            return JSON.stringify({
+                peerId: state.peerId,
+                found: Boolean(peer),
+                peerKept: peer?.__probe === 'kept',
+                channelKept: peer?.channel?.__probe === 'kept',
+                verified: peer?.verified === true,
+                open: peer?.channel?.readyState === 'open',
+                count: document.getElementById('peer-count').textContent,
+                roster: [...document.querySelectorAll('#peer-list li')].length,
+            });
+        """ % json.dumps(marks["otherId"]))
+        state_after = json.loads(after)
+        check("ivy keeps the same peer id across the resume",
+              state_after["peerId"] == marks["peerId"], str(state_after))
+        check("the peer object was not replaced", state_after["peerKept"] is True, str(state_after))
+        check("the DataChannel survived the resume", state_after["channelKept"] is True, str(state_after))
+        check("the channel is still open", state_after["open"] is True, str(state_after))
+        check("no re-verification was needed", state_after["verified"] is True, str(state_after))
+        check("the room did not double", state_after["count"] == "2/8", str(state_after))
+        check("the roster still holds exactly two", state_after["roster"] == 2, str(state_after))
+
+        # jonas saw a resume, not a departure and an arrival.
+        churn = await two.eval("""
+            const bodies = [...document.querySelectorAll('#log .msg-body')].map(n => n.textContent);
+            return JSON.stringify({
+                left: bodies.filter(t => / left\\.$/.test(t)).length,
+                joined: bodies.filter(t => / joined\\.$/.test(t)).length,
+                count: document.getElementById('peer-count').textContent,
+            });
+        """)
+        seen = json.loads(churn)
+        check("jonas was never told ivy left", seen["left"] == 0, str(seen))
+        check("jonas saw ivy join exactly once", seen["joined"] == 1, str(seen))
+        check("jonas still counts two people", seen["count"] == "2/8", str(seen))
+
+        still_talking = "resumed without a rebuild"
+        await send_chat(two, still_talking)
+        carried = await one.wait_for("""
+            return [...document.querySelectorAll('#log .msg-body')]
+                .some(n => n.textContent.includes('without a rebuild')) ? 'yes' : false;
+        """, seconds=60)
+        check("the surviving channel still carries chat", carried == "yes")
+
+        # The ICE restart branch itself. On loopback the connection never actually
+        # breaks, so resume() correctly declines to restart a working path -- the
+        # branch has to be reached by making the connection report failure.
+        print("\n[ resume() decides correctly per connection state ]")
+        decisions = await one.eval("""
+            const peer = [...state.peers.values()][0];
+            const result = {};
+
+            result.connectedNoRestart = (() => {
+                let restarts = 0;
+                const real = peer.pc.restartIce;
+                peer.pc.restartIce = () => { restarts += 1; };
+                const kept = peer.resume();
+                peer.pc.restartIce = real;
+                return kept === true && restarts === 0;
+            })();
+
+            const pretend = (value) => Object.defineProperty(peer.pc, 'connectionState', {
+                configurable: true, get: () => value,
+            });
+
+            result.failedRestarts = (() => {
+                let restarts = 0;
+                const real = peer.pc.restartIce;
+                peer.pc.restartIce = () => { restarts += 1; };
+                pretend('failed');
+                const kept = peer.resume();
+                delete peer.pc.connectionState;
+                peer.pc.restartIce = real;
+                clearTimeout(peer.connectTimer);
+                return kept === true && restarts === 1;
+            })();
+
+            result.disconnectedRestarts = (() => {
+                let restarts = 0;
+                const real = peer.pc.restartIce;
+                peer.pc.restartIce = () => { restarts += 1; };
+                pretend('disconnected');
+                const kept = peer.resume();
+                delete peer.pc.connectionState;
+                peer.pc.restartIce = real;
+                clearTimeout(peer.connectTimer);
+                return kept === true && restarts === 1;
+            })();
+
+            result.connectingRebuilds = (() => {
+                pretend('connecting');
+                const kept = peer.resume();
+                delete peer.pc.connectionState;
+                return kept === false;
+            })();
+
+            result.staleRebuilds = (() => {
+                peer.stale = true;
+                const kept = peer.resume();
+                peer.stale = false;
+                return kept === false;
+            })();
+
+            // The legacy path must produce a real ICE-restart offer, since that is
+            // the only option on an engine without restartIce().
+            result.legacyOffer = await (async () => {
+                const pc = new RTCPeerConnection();
+                pc.createDataChannel('probe');
+                await pc.setLocalDescription();
+                const first = pc.localDescription.sdp.match(/a=ice-ufrag:(\\S+)/)[1];
+                const offer = await pc.createOffer({ iceRestart: true });
+                const second = offer.sdp.match(/a=ice-ufrag:(\\S+)/)[1];
+                pc.close();
+                return first !== second;
+            })();
+
+            return JSON.stringify(result);
+        """)
+        decided = json.loads(decisions)
+        check("a connection that never broke is kept without a restart",
+              decided["connectedNoRestart"] is True, str(decided))
+        check("a failed connection is kept and gets an ICE restart",
+              decided["failedRestarts"] is True, str(decided))
+        check("a disconnected connection is kept and gets an ICE restart",
+              decided["disconnectedRestarts"] is True, str(decided))
+        check("one that never connected is rebuilt instead",
+              decided["connectingRebuilds"] is True, str(decided))
+        check("one whose channel died is rebuilt instead",
+              decided["staleRebuilds"] is True, str(decided))
+        check("iceRestart: true produces fresh ICE credentials",
+              decided["legacyOffer"] is True, str(decided))
+
+        # -- Phase two: the relay itself restarts -----------------------------
+        print("\n[ the relay restarts under two live clients ]")
+
+        # Phase one already put "lost the connection" and "Reconnected" in the log,
+        # so waiting for the text alone would match instantly and test nothing.
+        # Count first, then wait for the count to go up.
+        async def log_hits(page: Page, pattern: str) -> int:
+            return await page.eval(f"""
+                return [...document.querySelectorAll('#log .msg-body')]
+                    .filter(n => {pattern}.test(n.textContent)).length;
+            """)
+
+        lost_before = await log_hits(one, "/lost the connection/i")
+        back_before = await log_hits(one, "/reconnected/i")
+
+        # A restarted relay has lost every room, so both peers must come back with
+        # new ids. That makes the ids, not the headcount, the signal that a rebuild
+        # really happened -- the headcount reads 2/8 both before and after.
+        ids_before = json.loads(await one.eval("""
+            return JSON.stringify({ self: state.peerId, other: [...state.peers.keys()][0] });
+        """))
+
         relay.terminate()
         try:
             relay.wait(timeout=10)
         except subprocess.TimeoutExpired:
             relay.kill()
 
-        dropped = await one.wait_for("""
+        dropped = await one.wait_for(f"""
             return [...document.querySelectorAll('#log .msg-body')]
-                .some(n => /lost the connection/i.test(n.textContent)) ? 'yes' : false;
+                .filter(n => /lost the connection/i.test(n.textContent)).length > {lost_before}
+                ? 'yes' : false;
         """, seconds=45)
         check("ivy notices the relay went away", dropped == "yes",
               await one.eval("return document.getElementById('status-text').textContent;"))
 
-        torn = await one.wait_for(
-            "document.getElementById('peer-count').textContent === '1/8'", seconds=30)
-        check("ivy tears the stale mesh down", bool(torn),
-              await one.eval("return document.getElementById('peer-count').textContent;"))
+        # The mesh is deliberately *not* torn down. A relay outage says nothing
+        # about whether the peers can still reach each other, and dropping them
+        # here would throw away connections an ICE restart could repair.
+        held = await one.eval("return document.getElementById('peer-count').textContent;")
+        check("ivy keeps the room while the relay is away", held == "2/8", str(held))
 
-        empty_roster = await one.eval("""
-            return [...document.querySelectorAll('#peer-list li')].length;
+        kept_roster = await roster(one)
+        check("jonas stays in her roster through the outage",
+              len(kept_roster) == 2 and any("jonas" in (n or "") for n in kept_roster),
+              str(kept_roster))
+        no_exit = await one.eval("""
+            return [...document.querySelectorAll('#log .msg-body')]
+                .filter(n => / left\\.$/.test(n.textContent)).length;
         """)
-        check("only ivy is left in her roster", empty_roster == 1, str(empty_roster))
+        check("nobody is reported as having left", no_exit == 0, str(no_exit))
 
         # And back up.
         relay = start_relay()
         check("test relay restarted", await wait_up())
 
-        recovered = await one.wait_for("""
+        recovered = await one.wait_for(f"""
             return [...document.querySelectorAll('#log .msg-body')]
-                .some(n => /reconnected/i.test(n.textContent)) ? 'yes' : false;
+                .filter(n => /reconnected/i.test(n.textContent)).length > {back_before}
+                ? 'yes' : false;
         """, seconds=120)
         check("ivy reconnects unattended", recovered == "yes",
               await one.eval("return document.getElementById('status-text').textContent;"))
 
-        settled = await one.wait_for(
-            "document.getElementById('peer-count').textContent === '2/8'", seconds=120)
-        check("the room settles back to two people", bool(settled),
-              await one.eval("return document.getElementById('peer-count').textContent;"))
+        # Rebuilt, not resumed: both ids are new, and jonas's old entry is gone
+        # rather than sitting alongside the new one.
+        settled = await one.wait_for(f"""
+            const ids = [...state.peers.keys()];
+            return (state.peerId !== {json.dumps(ids_before['self'])}
+                && ids.length === 1
+                && ids[0] !== {json.dumps(ids_before['other'])}
+                && document.getElementById('peer-count').textContent === '2/8') ? 'yes' : false;
+        """, seconds=120)
+        check("the room settles back to two people, both with new ids", settled == "yes",
+              await one.eval("""
+                return JSON.stringify({
+                    self: state.peerId,
+                    peers: [...state.peers.keys()],
+                    count: document.getElementById('peer-count').textContent,
+                });
+              """))
 
         # The ghost check: exactly one of each person, not two.
-        duplicates = await one.eval("""
-            const names = [...document.querySelectorAll('#peer-list li')]
-                .map(li => li.querySelector('p')?.textContent.trim());
-            const jonas = names.filter(n => n && n.includes('jonas')).length;
-            return JSON.stringify({ names, jonas });
-        """)
-        counts = json.loads(duplicates)
-        check("no duplicate jonas after the reconnect", counts["jonas"] == 1, str(counts))
+        names = await roster(one)
+        jonas_rows = [n for n in names if n and "jonas" in n]
+        check("no duplicate jonas after the reconnect", len(jonas_rows) == 1, str(names))
+        check("and jonas is not renamed to jonas (2)", jonas_rows == ["jonas"], str(names))
 
         remade = await one.wait_for(
             "document.getElementById('transport').textContent.includes('1/1 connected')", seconds=120)
@@ -984,6 +1446,9 @@ async def main() -> int:
     try:
         await browser.start()
         await run(browser)
+        # Shares the browser and the relay, but uses a room of its own so it
+        # cannot disturb anything above.
+        await run_identity_checks(browser)
     except Exception as exc:  # noqa: BLE001 - report and keep going
         failed.append("harness")
         print(f"\n  ERROR {type(exc).__name__}: {exc}")

@@ -221,6 +221,59 @@ function initialsOf(nick) {
   return (trimmed[0] || '?').toUpperCase();
 }
 
+/** Longest display name we will render. Also the join field's maxlength. */
+const NICK_MAX = 24;
+
+/*
+ * Characters that let two different names render identically. Written as escapes
+ * on purpose: a literal zero-width space in this source would be invisible to
+ * the next person reading it, which is the very trick being defended against.
+ *
+ *   0000-0008, 000e-001f   C0 controls, except the whitespace ones
+ *   007f-009f              delete and the C1 controls
+ *   00ad                   soft hyphen
+ *   200b-200f              zero-width space and joiners, LTR and RTL marks
+ *   2028-202e              line/paragraph separators, bidi embedding, overrides
+ *   2060-2064              word joiner and the invisible operators
+ *   2066-2069              bidi isolates
+ *   feff                   byte order mark
+ *
+ * Tab through carriage return (0009-000d) are deliberately left out. They are
+ * whitespace, not invisible formatting, so they belong to the space-collapsing
+ * step below -- deleting them would turn "dan\nsmith" into one word, letting a
+ * control character change the visible text rather than merely disappear.
+ *
+ * Stripping the rest is the first half of stopping impersonation: without it, a
+ * name carrying a zero-width space renders exactly like the name without one,
+ * so it would never be detected as a collision.
+ */
+const NICK_INVISIBLES = new RegExp(
+  '[\\u0000-\\u0008\\u000e-\\u001f\\u007f-\\u009f\\u00ad\\u200b-\\u200f'
+  + '\\u2028-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]',
+  'g',
+);
+
+/**
+ * Reduce a claimed name to something safe to show.
+ *
+ * Applied to our own input at join time as well as to every incoming HELLO, so
+ * that what a peer sees for us is what we see for ourselves.
+ */
+function cleanNick(raw) {
+  const cleaned = String(raw == null ? '' : raw)
+    .replace(NICK_INVISIBLES, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, NICK_MAX)
+    .trim();
+  return cleaned || 'peer';
+}
+
+/** Names that differ only in case or spacing are the same name to a reader. */
+function foldNick(nick) {
+  return cleanNick(nick).toLocaleLowerCase();
+}
+
 /* ==========================================================================
    2. Crypto
    ========================================================================== */
@@ -325,8 +378,27 @@ const state = {
   roomId: '',
   roomKey: null,
   seal: null,
+  /** What we claim to be called. Sent in HELLO, never rewritten by anyone else. */
   nick: '',
+  /** What we are *displayed* as, which is nick plus a counter if it collided. */
+  label: '',
   peerId: '',
+  /**
+   * Arrival order, ours and each peer's.
+   *
+   * Seeded from the ordered roster in `welcome` and extended by a local counter
+   * for anyone who joins after. Everyone therefore agrees, which is what lets the
+   * display-name tiebreak be decided independently and still come out the same
+   * everywhere -- see resolveLabels().
+   *
+   * The roster has to come from the relay rather than being counted locally.
+   * `welcome.peers` lists the others but not where we sit among them, so after a
+   * full mesh rebuild every client would place itself at its own counter's
+   * position, two peers called the same thing would both think they were first,
+   * and both would keep the plain name.
+   */
+  arrivalSeq: 0,
+  selfOrder: 0,
   // Room coordination state, all of it server-assigned. Deliberately not taken
   // from DataChannel frames: a peer could claim anything there, whereas these
   // arrive over the signaling socket from the party that actually enforces them.
@@ -349,6 +421,13 @@ const state = {
   sessionId: '',
   reconnectAttempt: 0,
   reconnectTimer: null,
+  /**
+   * True from the moment the signaling socket drops until we are back in (or
+   * have given up). While it is set, a peer connection going to 'failed' is not
+   * treated as a lost peer: an ICE restart may still revive it, and tearing it
+   * down here would throw away the only thing a restart can repair.
+   */
+  reconnecting: false,
   peers: new Map(),      // peerId -> Peer
   incoming: new Map(),   // transferId -> { from, meta, parts, received }
   blobUrls: new Set(),
@@ -517,10 +596,29 @@ function connectRelay(roomId, requestedCapacity) {
 }
 
 /* --- Reconnect ------------------------------------------------------------
-   A dropped signaling socket used to be terminal: the message said peers would
-   stay connected, which is only true until one of them moves. Now the mesh is
-   torn down and rebuilt, because a half-live mesh whose members cannot learn
-   about each other any more is worse than a clean restart.
+   A dropped signaling socket was once terminal, and then it was a full mesh
+   rebuild. Neither is right for the common cause, which is a network change:
+   moving from wifi to 5G kills the socket and every ICE candidate pair at once,
+   but leaves the DTLS/SCTP association above them intact.
+
+   So the mesh is kept and repaired. On the way back in, each surviving peer gets
+   an ICE restart, which renegotiates only the route -- open DataChannels, the
+   room key, and each peer's verified status all carry through untouched. Peers
+   that cannot be repaired are rebuilt individually, and the relay's roster is
+   the authority on who is still there.
+
+   This works because the relay hands a reconnecting session back its *own* peer
+   id, so nobody else sees a departure and an arrival. Without that, everyone
+   else would tear their side down and the restart would have nothing to talk to.
+
+   The condition, stated plainly: the relay must not have finished tearing our
+   old socket down before the new one arrives. A network change satisfies it --
+   the phone's route disappears, so no close frame ever reaches the relay and it
+   keeps the peer until its own websocket ping times out, which is far longer
+   than a reconnect takes. A *graceful* close does not: the relay is told at once,
+   removes the peer, and tells the room. Then there is nothing to resume and this
+   falls back to a full rebuild, which is correct, just slower. Both paths end in
+   a working mesh; only the first one keeps the DataChannels.
    -------------------------------------------------------------------------- */
 
 const RECONNECT_BASE_MS = 1_000;
@@ -529,8 +627,11 @@ const RECONNECT_MAX_ATTEMPTS = 8;
 
 /**
  * Drop every peer connection and all per-connection state, keeping the room key
- * and identity. Called before re-joining so nothing from the previous session
- * survives into the new one.
+ * and identity.
+ *
+ * Only for the paths where reconnecting has stopped being possible: out of
+ * attempts, or the room filled up while we were away. A recoverable drop keeps
+ * the mesh and repairs it -- see syncRoster.
  */
 function resetMesh() {
   for (const peer of state.peers.values()) peer.close();
@@ -550,9 +651,15 @@ function resetMesh() {
 function scheduleReconnect() {
   if (!state.live || state.reconnectTimer !== null) return;
 
-  resetMesh();
+  // Set before anything else: it is what stops peers being torn down while their
+  // paths are failing, so there is still something to restart ICE on.
+  state.reconnecting = true;
 
   if (state.reconnectAttempt >= RECONNECT_MAX_ATTEMPTS) {
+    // Out of attempts. Now the mesh really is unrecoverable, because nothing
+    // will be signaling for it again.
+    state.reconnecting = false;
+    resetMesh();
     setStatus('degraded', 'Disconnected');
     systemMessage(
       `Gave up reconnecting to the relay after ${RECONNECT_MAX_ATTEMPTS} attempts. Reload to try again.`,
@@ -570,7 +677,7 @@ function scheduleReconnect() {
 
   setStatus('degraded', `Reconnecting in ${Math.round(delay / 1000)}s`);
   if (attempt === 0) {
-    systemMessage('Lost the connection to the relay. Rebuilding the room…', 'warn');
+    systemMessage('Lost the connection to the relay. Holding the room together…', 'warn');
   }
 
   state.reconnectTimer = setTimeout(() => {
@@ -591,6 +698,8 @@ async function rejoin() {
       // Someone took the slot while we were away. Retrying would just fail
       // again, so stop and say so.
       state.reconnectAttempt = RECONNECT_MAX_ATTEMPTS;
+      state.reconnecting = false;
+      resetMesh();
       setStatus('degraded', 'Room full');
       systemMessage('The room filled up while you were disconnected. Reload to try rejoining.', 'warn');
       return;
@@ -598,16 +707,68 @@ async function rejoin() {
     throw err;
   }
 
-  // Back in. The relay has already evicted our previous entry, so the roster it
-  // hands back does not contain us twice.
+  // Back in, and holding the same peer id as before, so every peer still has us
+  // at the address it knows.
   state.reconnectAttempt = 0;
+  state.reconnecting = false;
   applyWelcome(welcome);
-  systemMessage(
-    welcome.peers.length
-      ? `Reconnected. Re-establishing ${welcome.peers.length} ${welcome.peers.length === 1 ? 'connection' : 'connections'}.`
-      : 'Reconnected. Waiting for others.',
-  );
-  for (const peerId of welcome.peers) addPeer(peerId);
+
+  const { resumed, rebuilt, dropped } = syncRoster(welcome);
+  const parts = [];
+  if (resumed) parts.push(`${resumed} ${resumed === 1 ? 'connection' : 'connections'} kept`);
+  if (rebuilt) parts.push(`${rebuilt} rebuilding`);
+  if (dropped) parts.push(`${dropped} gone`);
+  systemMessage(parts.length ? `Reconnected — ${parts.join(', ')}.` : 'Reconnected. Waiting for others.');
+}
+
+/**
+ * Make our roster match the relay's, which is the only authority on who is
+ * actually in the room.
+ *
+ * Three cases, and the last two are what stop a reconnect from leaving ghosts:
+ * a peer the relay still lists is repaired in place, one it no longer lists is
+ * dropped however connected it looks to us, and one we have never heard of is
+ * built fresh. addPeer refuses ids we already hold and refuses our own, so no
+ * path through here can double an entry.
+ */
+function syncRoster(welcome) {
+  const peerIds = Array.isArray(welcome.peers) ? welcome.peers : [];
+  const present = new Set(peerIds);
+  let resumed = 0;
+  let rebuilt = 0;
+  let dropped = 0;
+
+  // Gone from the relay's list means gone, even if our side still shows a live
+  // connection -- that peer left and its socket has not finished dying yet.
+  for (const id of [...state.peers.keys()]) {
+    if (!present.has(id)) {
+      removePeer(id, 'stale');
+      dropped += 1;
+    }
+  }
+
+  for (const id of peerIds) {
+    const peer = state.peers.get(id);
+    if (!peer) {
+      addPeer(id);
+      rebuilt += 1;
+    } else if (peer.resume()) {
+      resumed += 1;
+    } else {
+      // Past repair: drop and rebuild this one connection.
+      removePeer(id, 'stale');
+      addPeer(id);
+      rebuilt += 1;
+    }
+  }
+
+  // The relay's ordering is authoritative and replaces whatever the local counter
+  // produced above, so a rebuild cannot leave two clients disagreeing about who
+  // arrived first.
+  applyRoster(welcome.roster);
+  applyLabels();
+  renderTransport();
+  return { resumed, rebuilt, dropped };
 }
 
 /** Adopt the relay's view of the room. Shared by the first join and every rejoin. */
@@ -631,6 +792,24 @@ function handleRelayMessage(message) {
       // is what keeps the two sides from offering at once.
       addPeer(message.peerId);
       break;
+
+    case 'peer-resumed': {
+      // That peer's signaling came back on a new socket. It kept its id, so the
+      // connection we hold is still addressed correctly and only needs its route
+      // renegotiated. No join, no leave, no name churn in the log.
+      const peer = state.peers.get(message.peerId);
+      if (!peer) {
+        addPeer(message.peerId);
+      } else if (!peer.resume()) {
+        const order = peer.order;
+        removePeer(message.peerId, 'stale');
+        addPeer(message.peerId);
+        const fresh = state.peers.get(message.peerId);
+        if (fresh) fresh.order = order;
+      }
+      renderTransport();
+      break;
+    }
 
     case 'peer-leave':
       removePeer(message.peerId, 'left');
@@ -695,11 +874,19 @@ function handleRelayMessage(message) {
 class Peer {
   constructor(peerId) {
     this.id = peerId;
+    /** What this peer claims to be called, straight from its HELLO. */
     this.nick = null;
+    /** What we display it as: nick, plus a counter if the name was taken. */
+    this.label = null;
+    /** Arrival index, assigned by addPeer. Decides display-name collisions. */
+    this.order = 0;
     this.muted = false;
     this.deafened = false;
     this.verified = false;
     this.dead = false;
+    /** Set when the transport died for good, so resume() rebuilds rather than
+     *  trying to restart ICE on a connection that has nothing left to restart. */
+    this.stale = false;
 
     // One side must lead. Ordering peer ids gives both sides the same answer
     // without another round trip.
@@ -728,7 +915,23 @@ class Peer {
     this.pc.ontrack = (event) => attachRemoteAudio(this.id, event.track);
     this.pc.onconnectionstatechange = () => {
       const s = this.pc.connectionState;
-      if (s === 'failed' || s === 'closed') removePeer(this.id, 'failed');
+      if (s === 'closed') {
+        removePeer(this.id, 'closed');
+        return;
+      }
+      if (s === 'failed') {
+        // While signaling is away this is not a lost peer, it is a lost path:
+        // switching from wifi to 5G invalidates every candidate pair, and ICE
+        // reports that as failure. An ICE restart fixes it once we can signal
+        // again, so keep the connection and let resume() deal with it.
+        if (state.reconnecting) {
+          this.stale = !this.channel || this.channel.readyState !== 'open';
+          renderTransport();
+          return;
+        }
+        removePeer(this.id, 'failed');
+        return;
+      }
       renderTransport();
     };
 
@@ -752,17 +955,70 @@ class Peer {
     sendToRelay({ type: 'signal', to: this.id, data });
   }
 
-  async negotiate() {
+  async negotiate(options) {
     if (!this.canOffer || this.dead) return;
     try {
       this.makingOffer = true;
-      await this.pc.setLocalDescription();
+      if (options?.iceRestart) {
+        // Explicit form, for engines without pc.restartIce(). Both produce an
+        // offer carrying fresh ICE credentials; restartIce() is just the one
+        // that cooperates with perfect negotiation on its own.
+        await this.pc.setLocalDescription(await this.pc.createOffer({ iceRestart: true }));
+      } else {
+        await this.pc.setLocalDescription();
+      }
       this.signal({ kind: 'desc', description: this.pc.localDescription.toJSON() });
     } catch {
       /* A failed offer surfaces through connectionstatechange. */
     } finally {
       this.makingOffer = false;
     }
+  }
+
+  /**
+   * Bring this connection back after the signaling socket was away.
+   *
+   * Returns false if it is past saving and the caller should build a fresh peer.
+   *
+   * The case this exists for is a network change: the phone moves from wifi to
+   * 5G, every candidate pair dies, and the signaling socket dies with them. The
+   * DTLS and SCTP association on top is *not* renegotiated by an ICE restart, so
+   * an open DataChannel survives one -- which means the room key, the verified
+   * flag, and the peer's identity all carry through. Rebuilding from scratch
+   * would discard all of that to fix what is only a routing problem.
+   */
+  resume() {
+    if (this.dead || this.stale) return false;
+    if (this.pc.signalingState === 'closed') return false;
+
+    const s = this.pc.connectionState;
+    if (s === 'connected') {
+      // Only signaling had dropped. The media path never noticed, so restarting
+      // ICE here would tear down a working connection to rebuild the same one.
+      return true;
+    }
+    if (s === 'new' || s === 'connecting') {
+      // Never established. Offers and candidates went missing while the socket
+      // was down, so there is no agreed state to restart from.
+      return false;
+    }
+
+    // 'disconnected' or 'failed': the pair is gone but the transport above it is
+    // intact. This is exactly what an ICE restart is for.
+    this.canOffer = true;
+    clearTimeout(this.connectTimer);
+    this.connectTimer = setTimeout(() => {
+      if (this.pc.connectionState !== 'connected') this.reject('lost');
+    }, CONNECT_TIMEOUT_MS);
+
+    if (typeof this.pc.restartIce === 'function') {
+      // Fires negotiationneeded, so negotiate() sends the offer. Glare with the
+      // peer restarting at the same instant is what perfect negotiation handles.
+      this.pc.restartIce();
+    } else {
+      this.negotiate({ iceRestart: true }).catch(noop);
+    }
+    return true;
   }
 
   /** Perfect negotiation, per the WebRTC spec's reference pattern. */
@@ -831,7 +1087,13 @@ class Peer {
       }).catch(noop);
     };
     channel.onmessage = (event) => this.receive(event.data);
-    channel.onclose = () => { if (!this.dead) removePeer(this.id, 'closed'); };
+    channel.onclose = () => {
+      if (this.dead) return;
+      // A closed channel is unrecoverable -- an ICE restart repairs routing, not
+      // a dead SCTP association. Mark it so resume() rebuilds instead of trying.
+      if (state.reconnecting) { this.stale = true; return; }
+      removePeer(this.id, 'closed');
+    };
   }
 
   async send(type, meta, payload) {
@@ -882,12 +1144,13 @@ class Peer {
   /** Refuse this peer, saying which of the two failures it was. */
   reject(reason) {
     if (this.dead) return;
-    const label = this.nick || `peer ${this.id.slice(0, 6)}`;
+    const label = this.label || this.nick || `peer ${this.id.slice(0, 6)}`;
     const reasons = {
       passkey: `Dropped ${label}: their passkey doesn't match this room.`,
       timeout: `Dropped ${label}: they never proved they hold the room key.`,
       unreachable: `Couldn't reach ${label}. Both sides may be behind networks that `
         + 'block direct connections, and the fallback relay did not answer either.',
+      lost: `Lost the connection to ${label} and couldn't rebuild the route to them.`,
     };
     systemMessage(reasons[reason] || reasons.timeout, 'warn');
     removePeer(this.id, reason);
@@ -912,7 +1175,10 @@ class Peer {
 
 function addPeer(peerId) {
   if (peerId === state.peerId || state.peers.has(peerId)) return;
-  state.peers.set(peerId, new Peer(peerId));
+  const peer = new Peer(peerId);
+  peer.order = state.arrivalSeq;
+  state.arrivalSeq += 1;
+  state.peers.set(peerId, peer);
   renderPeers();
 }
 
@@ -929,10 +1195,94 @@ function removePeer(peerId, reason) {
   }
 
   if (peer.verified && peer.nick && reason === 'left') {
-    systemMessage(`${peer.nick} left.`);
+    systemMessage(`${peer.label || peer.nick} left.`);
   }
-  renderPeers();
+  // Their name is free again, so whoever was carrying a counter because of them
+  // may not need it any more.
+  applyLabels();
   renderTransport();
+}
+
+/* --- Display names --------------------------------------------------------
+
+   Two people in one room must never render identically, or a newcomer can pass
+   for someone the others already trust. The relay cannot arbitrate this: it
+   never sees a display name, because names ride the encrypted HELLO frame. So
+   every client works it out independently and they all land on the same answer.
+
+   The rule: peers are ordered by arrival, and the first claim on a name keeps
+   it. A later claim on a name already taken renders with a counter -- "dan",
+   then "dan (2)". Nobody who is already here is ever renamed by someone else
+   arriving, which is what keeps the log stable.
+
+   What this is *not*: proof of identity. Everyone in the room shares one key, so
+   a peer can put any name it likes in its HELLO -- see README, "What this does
+   not protect against". What it guarantees is that you can always tell two
+   people apart, which is what the confusion depended on.
+   ------------------------------------------------------------------------- */
+
+/**
+ * Adopt the relay's ordering of the room.
+ *
+ * Called once every peer in the roster exists, so each one can be given its
+ * index. Anyone arriving later is numbered from arrivalSeq, and since the relay
+ * broadcasts joins in one order to everybody, those numbers agree too.
+ */
+function applyRoster(roster) {
+  if (!Array.isArray(roster) || !roster.length) return;
+  roster.forEach((id, index) => {
+    if (id === state.peerId) state.selfOrder = index;
+    else {
+      const peer = state.peers.get(id);
+      if (peer) peer.order = index;
+    }
+  });
+  state.arrivalSeq = roster.length;
+}
+
+/** The label currently shown for a peer id, ours included. */
+function labelFor(peerId) {
+  if (peerId && peerId === state.peerId) return state.label;
+  return state.peers.get(peerId)?.label || null;
+}
+
+/** Recompute every label from the claims we hold. Pure; renders nothing. */
+function resolveLabels() {
+  const claims = [{ order: state.selfOrder, id: state.peerId, nick: state.nick, self: true }];
+  for (const peer of state.peers.values()) {
+    // A peer that has not sent HELLO has claimed nothing, so there is nothing
+    // for it to collide with. It renders as "connecting…" until it does.
+    if (peer.nick) claims.push({ order: peer.order, id: peer.id, nick: peer.nick, peer });
+  }
+  // Arrival order decides it. The peer id only breaks a tie that should not
+  // happen, and does so the same way on every client.
+  claims.sort((a, b) => a.order - b.order || (a.id < b.id ? -1 : 1));
+
+  // Keyed on the label actually handed out, not on the claimed name. Counting
+  // occurrences of the name would leave a hole: with two people called "dan", a
+  // third could claim the literal string "dan (2)" and wear the label the second
+  // one had been given. Taking the next *free* label closes that -- they get
+  // "dan (2) (2)", which is inelegant and unambiguous, in that order of priority.
+  const used = new Set();
+  for (const claim of claims) {
+    let label = claim.nick;
+    let counter = 1;
+    while (used.has(foldNick(label))) {
+      counter += 1;
+      label = `${claim.nick} (${counter})`;
+    }
+    used.add(foldNick(label));
+    if (claim.self) state.label = label;
+    else claim.peer.label = label;
+  }
+}
+
+/** Recompute labels and push them everywhere a name is already on screen. */
+function applyLabels() {
+  resolveLabels();
+  renderPeers();
+  renderSelf();
+  relabelLog();
 }
 
 /* ==========================================================================
@@ -944,12 +1294,32 @@ function routeFrame(peer, frame) {
 
   switch (type) {
     case F.HELLO: {
-      const first = !peer.nick;
-      peer.nick = String(meta.nick || 'peer').slice(0, 24);
+      const previous = peer.nick;
+      const myLabelBefore = state.label;
+      peer.nick = cleanNick(meta.nick);
       peer.muted = Boolean(meta.muted);
       peer.deafened = Boolean(meta.deafened);
-      if (first) systemMessage(`${peer.nick} joined.`);
-      renderPeers();
+      applyLabels();
+
+      if (!previous) {
+        systemMessage(`${peer.nick} joined.`);
+        if (peer.label !== peer.nick) {
+          systemMessage(
+            `There is already a "${peer.nick}" here, so this one shows as "${peer.label}".`,
+            'warn',
+          );
+        }
+        if (state.label !== myLabelBefore) {
+          // Only reachable if their HELLO reached us before we had ours resolved
+          // against theirs -- rare, but say so rather than silently renaming.
+          systemMessage(`You are now shown as "${state.label}" to tell you apart.`, 'warn');
+        }
+      } else if (previous !== peer.nick) {
+        // A peer may rename itself at any time; nothing in the protocol can stop
+        // that. Saying so out loud is the point -- a silent rename onto someone
+        // else's name is exactly how impersonation would work.
+        systemMessage(`"${previous}" is now calling themselves "${peer.label}".`, 'warn');
+      }
       break;
     }
 
@@ -960,13 +1330,13 @@ function routeFrame(peer, frame) {
       break;
 
     case F.CHAT:
-      appendChat(peer.nick || 'peer', String(meta.text || '').slice(0, 4000), false);
+      appendChat(peer.id, String(meta.text || '').slice(0, 4000), false);
       break;
 
     case F.FILE_START: {
       const size = Number(meta.size) || 0;
       if (size > MAX_FILE_BYTES) {
-        systemMessage(`Refused ${meta.name} from ${peer.nick}: over the ${formatBytes(MAX_FILE_BYTES)} in-memory limit.`, 'warn');
+        systemMessage(`Refused ${meta.name} from ${peer.label}: over the ${formatBytes(MAX_FILE_BYTES)} in-memory limit.`, 'warn');
         break;
       }
       state.incoming.set(String(meta.id), {
@@ -1002,7 +1372,7 @@ function routeFrame(peer, frame) {
       const transfer = state.incoming.get(key);
       if (!transfer || transfer.from !== peer.id) break;
       state.incoming.delete(key);
-      appendFileCard(peer.nick || 'peer', transfer, false);
+      appendFileCard(peer.id, transfer, false);
       break;
     }
 
@@ -1026,7 +1396,7 @@ async function broadcastState() {
 
 async function sendChat(text) {
   const targets = verifiedPeers();
-  appendChat(state.nick, text, true);
+  appendChat(state.peerId, text, true);
   await Promise.allSettled(targets.map((p) => p.send(F.CHAT, { text })));
 }
 
@@ -1043,7 +1413,7 @@ async function sendFile(file) {
 
   const id = randomHex(8);
   const meta = { id, name: file.name, size: file.size, mime: file.type || 'application/octet-stream' };
-  const card = appendFileCard(state.nick, { meta, parts: [], received: 0 }, true);
+  const card = appendFileCard(state.peerId, { meta, parts: [], received: 0 }, true);
 
   await Promise.allSettled(targets.map((p) => p.send(F.FILE_START, meta)));
 
@@ -1282,9 +1652,9 @@ function renderSeal() {
 
 function renderSelf() {
   const avatar = $('self-avatar');
-  avatar.textContent = initialsOf(state.nick);
-  avatar.style.background = colorFor(state.nick);
-  $('self-nick').textContent = state.nick;
+  avatar.textContent = initialsOf(state.label);
+  avatar.style.background = colorFor(state.label);
+  $('self-nick').textContent = state.label;
 
   const bits = [];
   if (!audio.track) bits.push('No microphone');
@@ -1327,7 +1697,7 @@ function renderPeers() {
 
   list.appendChild(peerRow({
     id: 'self',
-    nick: `${state.nick}`,
+    nick: state.label,
     suffix: 'you',
     muted: audio.muted,
     deafened: audio.deafened,
@@ -1338,7 +1708,7 @@ function renderPeers() {
   for (const peer of peers) {
     list.appendChild(peerRow({
       id: peer.id,
-      nick: peer.nick || `connecting…`,
+      nick: peer.label || 'connecting…',
       suffix: '',
       muted: peer.muted,
       deafened: peer.deafened,
@@ -1537,14 +1907,27 @@ function pushToLog(node) {
   if (wasAtBottom) log.scrollTop = log.scrollHeight;
 }
 
-function messageShell(author, mine) {
+/**
+ * The avatar-plus-header frame every message shares.
+ *
+ * Takes a peer id rather than a name, and stamps it on the two nodes that show
+ * one. A display name can move after the fact -- someone leaves and frees up a
+ * name, or a second "dan" arrives -- and a log still showing the old one is the
+ * confusion this whole mechanism exists to prevent. relabelLog() walks these
+ * stamps.
+ */
+function messageShell(authorId, mine) {
+  const label = labelFor(authorId) || 'peer';
+
   const wrap = document.createElement('div');
   wrap.className = 'msg-enter flex gap-3 py-1.5';
 
   const avatar = document.createElement('div');
   avatar.className = 'h-8 w-8 flex-none rounded-full grid place-items-center text-[12px] font-semibold text-ink mt-0.5';
-  avatar.style.background = colorFor(author);
-  avatar.textContent = initialsOf(author);
+  avatar.style.background = colorFor(label);
+  avatar.textContent = initialsOf(label);
+  avatar.dataset.author = authorId;
+  avatar.dataset.field = 'avatar';
   wrap.appendChild(avatar);
 
   const column = document.createElement('div');
@@ -1554,8 +1937,11 @@ function messageShell(author, mine) {
   head.className = 'flex items-baseline gap-2';
   const name = document.createElement('span');
   name.className = 'text-[13.5px] font-semibold';
-  name.style.color = mine ? 'var(--text)' : colorFor(author);
-  name.textContent = author;
+  name.style.color = mine ? 'var(--text)' : colorFor(label);
+  name.textContent = label;
+  name.dataset.author = authorId;
+  name.dataset.field = 'name';
+  if (mine) name.dataset.mine = '1';
   const time = document.createElement('span');
   time.className = 'text-[11px] text-faint';
   time.textContent = clockTime();
@@ -1566,9 +1952,24 @@ function messageShell(author, mine) {
   return { wrap, column };
 }
 
-function appendChat(author, text, mine) {
+/** Repaint author names already in the log after a label change. */
+function relabelLog() {
+  for (const node of $('log').querySelectorAll('[data-author]')) {
+    const label = labelFor(node.dataset.author);
+    if (!label) continue;
+    if (node.dataset.field === 'avatar') {
+      node.textContent = initialsOf(label);
+      node.style.background = colorFor(label);
+    } else {
+      node.textContent = label;
+      if (node.dataset.mine !== '1') node.style.color = colorFor(label);
+    }
+  }
+}
+
+function appendChat(authorId, text, mine) {
   if (!text) return;
-  const { wrap, column } = messageShell(author, mine);
+  const { wrap, column } = messageShell(authorId, mine);
   const body = document.createElement('p');
   body.className = 'msg-body text-[14.5px] leading-relaxed mt-0.5';
   body.textContent = text; // textContent, never innerHTML: peer input is untrusted
@@ -1590,8 +1991,8 @@ function systemMessage(text, tone) {
   pushToLog(row);
 }
 
-function appendFileCard(author, transfer, mine) {
-  const { wrap, column } = messageShell(author, mine);
+function appendFileCard(authorId, transfer, mine) {
+  const { wrap, column } = messageShell(authorId, mine);
 
   const card = document.createElement('div');
   card.className = 'mt-1.5 rounded-lg border hairline bg-ink px-3 py-2.5 max-w-[420px]';
@@ -1759,7 +2160,10 @@ async function join(roomName, passkey, nick, wantMic, requestedCapacity) {
   }
 
   state.roomName = roomName;
-  state.nick = nick;
+  // Cleaned here as well as on arrival, so what peers show for us is what we
+  // show for ourselves.
+  state.nick = cleanNick(nick);
+  state.label = state.nick;
   state.roomKey = session.roomKey;
   state.roomId = session.roomId;
   state.seal = session.seal;
@@ -1767,6 +2171,8 @@ async function join(roomName, passkey, nick, wantMic, requestedCapacity) {
   // the same person rather than a new arrival.
   state.sessionId = randomHex(16);
   state.reconnectAttempt = 0;
+  state.reconnecting = false;
+  state.arrivalSeq = 0;
 
   let micReady = false;
   if (wantMic) {
@@ -1817,6 +2223,9 @@ async function join(roomName, passkey, nick, wantMic, requestedCapacity) {
   );
 
   for (const peerId of welcome.peers) addPeer(peerId);
+  // After the peers exist, so each one can be handed its position.
+  applyRoster(welcome.roster);
+  applyLabels();
 
   state.levelFrame = requestAnimationFrame(levelLoop);
   state.statsTimer = setInterval(collectStats, 2000);
@@ -1870,6 +2279,9 @@ function destroySession() {
   state.hostId = '';
   state.sessionId = '';
   state.reconnectAttempt = 0;
+  state.reconnecting = false;
+  state.arrivalSeq = 0;
+  state.selfOrder = 0;
   capacityIntent = null;
 }
 

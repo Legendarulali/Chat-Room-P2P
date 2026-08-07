@@ -138,9 +138,9 @@ chat.example.com {
 ## Layout
 
 ```
-server/main.py            the entire server (~470 lines)
+server/main.py            the entire server (~900 lines, ~40% comment)
 client/index.html         markup, design tokens, component CSS
-client/app.js             crypto, mesh, protocol, audio, UI
+client/app.js             crypto, mesh, protocol, audio, UI (~2500 lines)
 tests/signaling_test.py   black-box checks against a running relay
 tests/browser_e2e_test.py two headless browsers, driven over DevTools Protocol
 tests/keepalive_test.py   the self-ping loop and its Discord notice
@@ -230,6 +230,7 @@ What the server enforces, and how you can confirm it:
 | Rooms die when empty | `Rooms.leave` does `del self._rooms[room_id]` on the last departure | `tests/signaling_test.py` asserts it against `/api/debug/stats` |
 | Server never sees room names | It rejects anything that is not 64 lowercase hex, so a plaintext name cannot even be submitted | `tests/signaling_test.py` tries five malformed ids |
 | Server never sees messages | Payloads are relayed as opaque JSON; chat never touches the relay at all | `tests/signaling_test.py` asserts byte-identical relay |
+| Server never sees display names | Names ride the encrypted `HELLO` frame on the peers' DataChannel. The relay has no field for one, which is why de-duplication is a client's job | `grep -niE "nick\|display.?name" server/main.py` — every hit is a comment |
 | Health endpoint leaks nothing | Returns `{"ok": true}` — deliberately not a room count, which would itself be metadata | `tests/signaling_test.py` |
 | Client stores nothing | No `localStorage`, `sessionStorage`, `indexedDB`, `caches`, or `document.cookie` anywhere | `tests/signaling_test.py` greps the served `app.js` for API *use* |
 
@@ -274,40 +275,117 @@ before treating any of this as enforcement.
 
 ---
 
-## Reconnects and ghost peers
+## Reconnects: repaired, not rebuilt
 
-A dropped signaling socket used to be terminal. Now the client rebuilds:
+The common cause of a dropped signaling socket is a network change — a phone
+moving from wifi to 5G. That kills the socket and every ICE candidate pair at
+once, but leaves the DTLS/SCTP association above them intact. So the mesh is
+kept and repaired rather than torn down:
 
-- **The mesh is torn down first.** Every `RTCPeerConnection` is closed, remote
-  audio detached, partial transfers dropped, and the roster cleared before any
-  rejoin attempt. A half-live mesh whose members can no longer learn about each
-  other is worse than a clean restart.
-- **Then it rejoins,** with exponential backoff and jitter (1s doubling to 15s,
-  eight attempts) so a relay restart does not bring every client back in the
-  same instant.
-- **The room key is kept.** Reconnecting does not re-derive anything or ask for
-  the passkey again; PBKDF2 runs once per session.
+- **Surviving peers get an ICE restart.** `restartIce()` where the browser has it,
+  `createOffer({ iceRestart: true })` otherwise. Only the route is renegotiated,
+  so open DataChannels, the room key, and each peer's verified status all carry
+  through — no re-handshake, no re-verification, no `X left`/`X joined` churn.
+- **Peers past repair are rebuilt individually.** A connection that never got
+  established, or whose channel actually closed, is replaced. An ICE restart
+  fixes routing; it cannot revive a dead SCTP association.
+- **The relay's roster is the authority on membership.** Anyone it no longer lists
+  is dropped however live the connection looks locally, so a reconnect cannot
+  leave a ghost behind.
+- **Backoff with jitter** (1s doubling to 15s, eight attempts) so a relay restart
+  does not bring every client back in the same instant.
+- **The room key is kept.** Reconnecting never re-derives anything or asks for the
+  passkey again; PBKDF2 runs once per session.
 
-### Why a reconnect used to double the room
+While a reconnect is pending, a peer connection reporting `failed` is *not*
+treated as a lost peer. That state is what a network change looks like from the
+inside, and dropping the peer there would discard the only thing a restart can
+repair.
 
-Each connection gets a fresh peer id, so a client that reconnected appeared
-beside its own previous entry, and the room inflated — `1/6` becoming `6/6` as a
-phone changed network a few times — until the stale socket finally timed out.
+### What makes the identity survive
 
-The fix is a **session id**: 16 random bytes generated per page load, sent with
-`join`. If a room already holds that session, the relay evicts the earlier entry
-*before* the capacity check, so a reconnecting peer reclaims its own slot instead
-of competing with its ghost for the last one. A reconnecting host also keeps the
-crown rather than handing it away for the length of a network blip.
+Each connection used to get a fresh peer id, which caused two problems. The
+visible one: a client that reconnected appeared *beside* its own previous entry,
+and the room inflated — `1/6` becoming `6/6` as a phone changed network a few
+times — until the stale socket timed out. The subtler one: to everyone else a
+reconnect looked like a departure followed by an arrival, so they tore their side
+down and an ICE restart had nothing left to talk to.
+
+Both are fixed by a **session id**: 16 random bytes generated per page load, sent
+with `join`. A room that already holds that session hands the returning client
+back the *same peer id*, and does not count it against capacity — it was already
+counted. So a reconnect reclaims its own slot, keeps the crown if it had it
+(the crown points at a peer id that never changed), and the rest of the room hears
+`peer-resumed` instead of a leave and a join.
+
+The relay also sends the room's **ordered roster** in `welcome`, including the
+recipient. Clients need an arrival order they all agree on — it is what decides
+duplicate display names — and `peers` alone cannot give it, because it does not
+say where the recipient sits. Without it, two clients that both rebuilt would each
+place themselves first, and two people called the same thing would both keep the
+plain name.
 
 The session id is random per page load, never persisted, and not derived from
-anything identifying. It does let the relay link a reconnect to a prior
-connection for as long as the room lives — that is the metadata cost of not
-counting people twice.
+anything identifying. It does let the relay link a reconnect to a prior connection
+for as long as the room lives — that is the metadata cost of not counting people
+twice.
 
-`peer-leave` is announced exactly once per departure: eviction broadcasts it, and
-the evicted socket's own teardown then suppresses the duplicate rather than
-telling the room a second time.
+### Where this stops working
+
+A resume needs the relay to still be holding the old socket when the new one
+arrives. Two cases where it is not, both of which fall back to a full rebuild:
+
+- **A graceful close.** If a close frame actually reaches the relay, the peer is
+  removed at once and the room is told. A network change does not do this — the
+  route is gone, so nothing arrives and the relay keeps the peer until its own
+  websocket ping times out, which is far longer than a reconnect takes.
+- **The relay restarting.** Rooms live in memory, so a restart loses every session
+  mapping. There is nothing to resume and everyone gets new ids.
+
+Both end in a working mesh. Only the first path keeps the DataChannels.
+
+---
+
+## Display names
+
+Two people in a room must never render identically, or a newcomer can pass for
+someone the others already trust. So names are de-duplicated: the first claim on a
+name keeps it, and a later claim takes the next free counter — `dan`, then
+`dan (2)`. Arrival order decides, so nobody already in the room is renamed by a
+newcomer.
+
+*Next free* rather than *nth occurrence*, because counting occurrences leaves a
+hole: with two people called `dan`, a third could claim the literal string
+`dan (2)` and wear the label the second one had been given. Taking the next free
+label instead makes them `dan (2) (2)` — inelegant and unambiguous, in that order
+of priority.
+
+Claimed names are also stripped of characters that let two different names *look*
+the same: C0/C1 controls, the soft hyphen, zero-width spaces and joiners, bidi
+marks and overrides, the invisible operators, and the BOM. Tab through carriage
+return are deliberately left in and collapsed to a space instead, so a control
+character cannot silently join two words. Comparison folds case and spacing, so
+`Dan`, `dan`, and `dan ` are one name rather than three.
+
+### Why the relay does not enforce this
+
+**Display names never reach the relay.** They travel inside the encrypted `HELLO`
+frame on the peers' own DataChannel, sealed with a room key the relay cannot
+derive, so there is nothing there to compare. Enforcing uniqueness server-side
+would mean putting every nickname in the `join` message in the clear, which would
+hand the relay the one thing it currently cannot have: a roster of who is in which
+room.
+
+So the check runs on the clients, where the names actually exist and where every
+peer already sees every other peer's claim. It is deterministic — arrival order,
+then peer id to break a tie that should not happen — so every client derives the
+same answer with nothing coordinating them. The test suite asserts that agreement
+directly across three clients, because a mechanism where each client picked its
+own answer would be worse than the duplicate it replaced.
+
+A peer may also rename itself mid-session; nothing in the protocol can prevent
+that. It is announced in the log rather than absorbed silently, because a silent
+rename onto someone else's name is exactly how impersonation would work.
 
 ---
 
@@ -389,6 +467,14 @@ name. It is not possible to prove *which* member sent a message. Fixing this
 needs per-peer signing keys, which is not implemented. Treat display names as a
 convenience among people who already trust each other.
 
+Display names are de-duplicated and stripped of invisible characters (see
+[Display names](#display-names)), which guarantees something narrower and worth
+being precise about: **you can always tell two people apart.** Two occupants can
+never render as the same string, and a name cannot be dressed up to look like
+another one. That is not the same as knowing who anyone is. A peer claiming your
+name still gets into the room — it just shows up as `you (2)` rather than as a
+second, indistinguishable you.
+
 **The browser is not a clean room.** `chrome://webrtc-internals` records SDP and
 connection stats locally, DevTools can inspect a live page, and OS memory can be
 paged to disk. The app avoids every storage API and sets `no-store` and a strict
@@ -466,7 +552,7 @@ through scale, weight, and tracking instead.
 
 ## Tests
 
-235 assertions across three suites. The first two need a live relay; start it
+320 assertions across three suites. The first two need a live relay; start it
 first:
 
 ```powershell
@@ -475,17 +561,23 @@ $env:DEBUG_STATS = "1"
 ```
 
 ```powershell
-# 104 assertions: protocol, validation, isolation, host assignment and
-# reassignment, custom capacity and its clamps, host-only resize, reconnect
-# session replacement, room deletion, rate limiting, security headers, CORS
+# 119 assertions: protocol, validation, isolation, host assignment and
+# reassignment, custom capacity and its clamps, host-only resize, room deletion,
+# rate limiting, security headers, CORS, and the reconnect contract -- that a
+# resume reclaims its own peer id, holds its place in the ordered roster, is
+# admitted into a room already at capacity, and that the socket it displaced
+# cannot evict it on the way out
 .venv\Scripts\python.exe tests\signaling_test.py
 
-# 108 assertions in real headless browsers: key agreement, mesh formation,
+# 178 assertions in real headless browsers: key agreement, mesh formation,
 # encrypted chat, file integrity, voice tracks, mute/deafen, the crown and
 # host stepper, capacity refusal, crown inheritance, teardown, and signaling
 # address resolution -- including a page served from a static host, to prove
-# it does not signal to its own origin, and a relay restart under two live
-# clients to prove they rebuild without duplicating each other
+# it does not signal to its own origin. Three clients all claiming the same
+# name check that every one of them derives the same labels for the same
+# people. Two clients on a private relay cover both outages: a moved
+# signaling path, where the DataChannel object itself must survive, and a
+# relay restart, where both peers must come back with new ids and no ghosts
 .venv\Scripts\python.exe tests\browser_e2e_test.py
 ```
 
@@ -510,7 +602,7 @@ Client → relay:
 
 | Message | Meaning |
 | --- | --- |
-| `{"type":"join","room":"<64 hex>","capacity":8,"sessionId":"<32 hex>"}` | Enter a room. `capacity` is optional and only honoured if this join creates the room. `sessionId` is optional; when it matches an existing occupant the relay treats this as a reconnect and evicts the older entry. Answered with `welcome` or `error`. |
+| `{"type":"join","room":"<64 hex>","capacity":8,"sessionId":"<32 hex>"}` | Enter a room. `capacity` is optional and only honoured if this join creates the room. `sessionId` is optional; when it matches an existing occupant the relay treats this as a reconnect, hands back that occupant's peer id, and does not count it against capacity. Answered with `welcome` or `error`. |
 | `{"type":"signal","to":"<peerId>","data":{…}}` | Relay `data` verbatim to one peer in your room. |
 | `{"type":"set-capacity","capacity":10}` | Host only. Answered with a broadcast `room-meta`, or `not_host`. |
 | `{"type":"leave"}` | Disconnect. |
@@ -520,10 +612,11 @@ Relay → client:
 
 | Message | Meaning |
 | --- | --- |
-| `{"type":"welcome","peerId","peers":[…],"hostId","capacity","ceiling","minCapacity"}` | Admitted. `peers` lists who was already there; `hostId` equals `peerId` if you opened the room. |
+| `{"type":"welcome","peerId","peers":[…],"roster":[…],"hostId","capacity","ceiling","minCapacity"}` | Admitted. `peers` lists who was already there. `roster` is the whole room in arrival order, **including you** — clients need a shared ordering to resolve duplicate display names. `hostId` equals `peerId` if you opened the room. |
 | `{"type":"room-meta","hostId","capacity"}` | The host or the capacity changed. Sent on a resize and on host reassignment. |
 | `{"type":"peer-join","peerId"}` | Someone arrived. |
 | `{"type":"peer-leave","peerId"}` | Someone left. |
+| `{"type":"peer-resumed","peerId"}` | That peer's signaling socket came back on the same id. The connection you hold is still addressed correctly; restart its ICE rather than rebuilding it. |
 | `{"type":"signal","from":"<peerId>","data":{…}}` | A relayed payload. |
 | `{"type":"error","code":"…"}` | `bad_room_id`, `room_full`, `not_host`, `not_joined`, `already_joined`, `no_such_peer`, `bad_json`, `bad_request`, `unknown_type`, `frame_too_large`, `rate_limited`. |
 
