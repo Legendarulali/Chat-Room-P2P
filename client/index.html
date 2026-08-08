@@ -4,8 +4,39 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="referrer" content="no-referrer" />
-<meta name="robots" content="noindex, nofollow, noarchive" />
-<title>Chat Room P2P — ephemeral encrypted rooms</title>
+
+<!--
+  This page is indexable. That is safe here only because a room code never
+  appears in a URL — rooms are joined by typing the code into the UI, so there
+  is no per-room address for a crawler to find, follow, or archive. If a future
+  change ever puts a room code in the path, the query, or the fragment, put the
+  noindex back before shipping it.
+-->
+<meta name="robots" content="index, follow" />
+<title>Chat Room P2P - Ephemeral Zero-Knowledge E2EE Chat</title>
+
+<meta name="description" content="Free peer-to-peer chat rooms with end-to-end encryption. Text, files, and voice go browser to browser over WebRTC. No accounts, no database, no history — a room exists only while people are in it." />
+<meta name="keywords" content="p2p chat, end-to-end encrypted chat, e2ee, zero-knowledge chat, ephemeral chat room, webrtc chat, private chat, anonymous chat, no signup chat, encrypted file sharing, encrypted voice chat, serverless chat" />
+<meta name="author" content="Legendarulali" />
+<meta name="theme-color" content="#0f1115" />
+
+<link rel="canonical" href="https://chat-room-p2p.vercel.app/" />
+
+<!-- Open Graph — link previews on Facebook, LinkedIn, Discord, Signal, etc. -->
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://chat-room-p2p.vercel.app/" />
+<meta property="og:title" content="Chat Room P2P - Ephemeral Zero-Knowledge E2EE Chat" />
+<meta property="og:description" content="Free peer-to-peer chat rooms with end-to-end encryption. Text, files, and voice go browser to browser over WebRTC. No accounts, no database, no history." />
+<meta property="og:site_name" content="Chat Room P2P" />
+<meta property="og:locale" content="en_US" />
+
+<!-- Twitter / X card. summary rather than summary_large_image: there is no
+     preview image to point at, and a large-image card without one renders
+     worse than a small one. -->
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:url" content="https://chat-room-p2p.vercel.app/" />
+<meta name="twitter:title" content="Chat Room P2P - Ephemeral Zero-Knowledge E2EE Chat" />
+<meta name="twitter:description" content="Free peer-to-peer chat rooms with end-to-end encryption. Text, files, and voice go browser to browser over WebRTC. No accounts, no database, no history." />
 
 <!--
   ============================================================================

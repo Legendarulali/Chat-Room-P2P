@@ -1,0 +1,9 @@
+# Chat Room P2P — https://chat-room-p2p.vercel.app/
+#
+# Everything here is one static page. Room codes never appear in a URL, so
+# there is nothing per-room for a crawler to reach.
+
+User-agent: *
+Allow: /
+
+Sitemap: https://chat-room-p2p.vercel.app/sitemap.xml
